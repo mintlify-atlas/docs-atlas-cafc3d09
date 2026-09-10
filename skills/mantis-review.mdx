@@ -1,7 +1,7 @@
 ---
 title: "/mantis-review: False Positive Filter and Validator"
 sidebarTitle: "/mantis-review"
-description: "Independently validate deduplicated findings against source code, filter false positives using 13 strict negative constraints, and produce triage checklists for downstream stages."
+description: "Independently validate deduplicated findings and filter false positives using 13 strict negative constraints with triage checklists for downstream stages."
 ---
 
 After deduplication, every finding is still unverified — it may be a
@@ -17,7 +17,7 @@ it on consolidated findings after `/mantis-dedupe` and before
 
 ## Command
 
-```
+```text
 /mantis-review [--snapshot_root=<path>] [--snapshot_id=<id>] [--state_root=<path>] [--target_root=<path>]
 ```
 
@@ -61,7 +61,7 @@ it on consolidated findings after `/mantis-dedupe` and before
 
 ## Usage
 
-```
+```text
 /mantis-review
 ```
 
@@ -71,7 +71,7 @@ and writes verdict fields back in place.
 
 **With a pinned snapshot:**
 
-```
+```text
 /mantis-review \
   --snapshot_root=/tmp/mantis_snapshots/pass_3 \
   --snapshot_id=abc123def456 \

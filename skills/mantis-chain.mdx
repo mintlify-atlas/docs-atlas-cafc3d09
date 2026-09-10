@@ -1,7 +1,7 @@
 ---
-title: "/mantis-chain: Multi-Step Exploit Chain Builder"
+title: "/mantis-chain: Multi-Step Exploit Chain Constructor"
 sidebarTitle: "/mantis-chain"
-description: "Combine individually validated low-severity findings into high-impact multi-step exploit chains, creating Super Finding records with a constituent_findings UUID array."
+description: "Combine individually validated findings into high-impact multi-step exploit chains stored as Super Finding records with constituent UUID arrays."
 ---
 
 Individually, a path traversal that writes only to `/tmp` or a stored XSS with
@@ -18,7 +18,7 @@ patch code.
 
 ## Command
 
-```
+```text
 /mantis-chain [--snapshot_root=<path>] [--snapshot_id=<id>]
               [--state_root=<path>] [--target_root=<path>]
 ```
@@ -69,7 +69,7 @@ patch code.
 
 ## Usage
 
-```
+```text
 /mantis-chain
 ```
 
@@ -79,7 +79,7 @@ chain finding JSON files.
 
 **With a pinned snapshot:**
 
-```
+```text
 /mantis-chain \
   --snapshot_root=/tmp/mantis_snapshots/pass_3 \
   --snapshot_id=abc123def456 \

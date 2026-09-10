@@ -1,5 +1,5 @@
 ---
-title: "Orchestrate Continuous Reviews with Meta-Agent"
+title: "Mantis Meta-Agent: Continuous Review Orchestration"
 sidebarTitle: "Meta-Agent"
 description: "Use /mantis-meta-agent as a persistent supervisor to run continuous security review campaigns with snapshot pinning, GC, and Pub/Sub alerting."
 ---
@@ -83,7 +83,7 @@ Each pinned snapshot consumes disk space under `.mantis_snapshots/`. Use `--snap
 /mantis-meta-agent --sync --snapshot_keep=3
 ```
 
-This retains the three most recent snapshots and deletes older ones. Setting `N=1` keeps only the current pass's snapshot. The default retains all snapshots.
+This retains the three most recent snapshots and deletes older ones. Setting `N=1` keeps only the current pass's snapshot. The default is `2` (the current pass plus the immediately preceding one).
 
 ## Pub/Sub Alerting for Unattended Notifications
 

@@ -8,7 +8,7 @@ The `/mantis-researcher` skill consumes `workspace/plan.json` and performs thoro
 
 ## Command
 
-```
+```bash
 /mantis-researcher [--snapshot_root <dir>] [--snapshot_id <id>]
                    [--state_root <dir>] [--target_root <dir>]
 ```
@@ -124,7 +124,7 @@ Every finding has a deterministic content-identity signature and a cross-pass li
     The signature is stable across passes as long as the title, CWE, and primary file path remain the same. It is used by `/mantis-plan` (Block B snapshot match) and `/mantis-dedupe` for cross-pass folding.
   </Tab>
   <Tab title="Lineage ID">
-    The researcher scans `workspace/archive/findings_pass_*/` for any archived finding whose `signature` matches:
+    The researcher scans `workspace/archive/findings_pass_*/` and `workspace/archive/loop*_findings/` for any archived finding whose `signature` matches:
 
     - **Exact match found:** inherit the ancestor's `lineage_id` (chain the lineage). If multiple match, inherit from the most recent pass.
     - **No exact match, but basename rename:** inherit from an ancestor whose `code_paths[0]` basename matches AND whose old full path no longer exists under `CODE_ROOT`. Add a `lineage-via-basename-rename` history note.

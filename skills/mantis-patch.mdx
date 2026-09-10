@@ -1,7 +1,7 @@
 ---
-title: "/mantis-patch: Automated Security Patch Generator"
+title: "/mantis-patch: Automated Source Code Patch Generator"
 sidebarTitle: "/mantis-patch"
-description: "Generate minimal security patches in transactional shadow isolation, verify them with a full unpatched-baseline gate, and confirm with independent ≥3-variant re-attack runs."
+description: "Generate minimal security patches in shadow isolation, verify with a full unpatched-baseline gate, and confirm with independent ≥3-variant re-attack runs."
 ---
 
 Once a vulnerability has been reproduced, `/mantis-patch` takes over: it reads
@@ -17,7 +17,7 @@ for initial vulnerability research or for generating reproduction payloads.
 
 ## Command
 
-```
+```text
 /mantis-patch [--target_root=<path>] [--state_root=<path>]
               [--snapshot_root=<path>] [--snapshot_id=<id>]
               [--snapshot_pinned=<true|false>]
@@ -74,7 +74,7 @@ for initial vulnerability research or for generating reproduction payloads.
 
 ## Usage
 
-```
+```text
 /mantis-patch
 ```
 
@@ -83,7 +83,7 @@ live workspace.
 
 **With a pinned snapshot:**
 
-```
+```text
 /mantis-patch \
   --snapshot_root=/tmp/mantis_snapshots/pass_3 \
   --snapshot_id=abc123def456 \
@@ -222,7 +222,7 @@ with only minor line-number shifts.
 
 **3-Way Merge Mechanics** (from `references/patch_rebasing.md`):
 
-```
+```text
 base  = prior snapshot's unpatched version (scratch copy)
 ours  = base + prior patch_diff applied   (scratch copy)
 theirs = current snapshot's unpatched version (scratch copy)

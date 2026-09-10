@@ -166,7 +166,7 @@ Before diving into execution order, it is important to distinguish optional pre-
 ### Stage 10 — `/mantis-chain`
 
 <Accordion title="Inputs, outputs, and workspace paths">
-  **Reads:** `workspace/findings/*.json` (reproduced or statically confirmed findings); `workspace/kb/`
+  **Reads:** `workspace/findings/*.json` (findings with `status: VALID` and production viability `VIABLE`, `CONDITIONAL_VIABLE`, or `SAMPLE_OR_TEST`); `workspace/kb/`
 
   **Writes:** New `workspace/findings/<uuid>.json` files — "Super Findings" with `constituent_findings` arrays listing the UUIDs of chained vulnerabilities
 

@@ -1,5 +1,5 @@
 ---
-title: "/mantis-dedupe: Duplicate Finding Consolidation"
+title: "/mantis-dedupe: Duplicate Security Finding Consolidation"
 sidebarTitle: "/mantis-dedupe"
 description: "Cluster and merge identical or overlapping security findings into single canonical records, eliminating redundant reports before downstream review stages."
 ---
@@ -8,7 +8,7 @@ After a research pass, the `workspace/findings/` directory often contains multip
 
 ## Command
 
-```
+```text
 /mantis-dedupe [--snapshot_root=<path>] [--snapshot_id=<id>] [--state_root=<path>]
 ```
 
@@ -65,7 +65,7 @@ After a research pass, the `workspace/findings/` directory often contains multip
 
 ## Usage
 
-```
+```text
 /mantis-dedupe
 ```
 
@@ -76,7 +76,7 @@ primary files and transaction log.
 
 **With a pinned snapshot (orchestrator-managed pipeline):**
 
-```
+```text
 /mantis-dedupe \
   --snapshot_root=/tmp/mantis_snapshots/pass_3 \
   --snapshot_id=abc123def456 \

@@ -1,5 +1,5 @@
 ---
-title: "Configure AI Models for Each Pipeline Stage"
+title: "Configure AI Models and Providers for Mantis Stages"
 sidebarTitle: "Models"
 description: "Set MANTIS_MODEL, per-node model overrides, and provider routing for Gemini, Claude, and custom OpenAI-compatible endpoints across all pipeline stages."
 ---
@@ -12,8 +12,10 @@ The reference implementation ships with a curated list of recommended models. Th
 
 | Model ID | Provider | Tier |
 |----------|----------|------|
-| `gemini-3.7-flash` | Google (Vertex AI or AI Studio) | General purpose |
-| `gemini-3.5-flash-lite` | Google (Vertex AI or AI Studio) | Fast / triage |
+| `gemini-3.7-flash` | Google (AI Studio; auto-routes to Vertex AI when `VERTEXAI_PROJECT` is set) | General purpose |
+| `gemini-3.5-flash-lite` | Google (AI Studio; auto-routes to Vertex AI when `VERTEXAI_PROJECT` is set) | Fast / triage |
+| `vertex_ai/gemini-3.7-flash` | Google Vertex AI | General purpose |
+| `vertex_ai/gemini-3.5-flash-lite` | Google Vertex AI | Fast / triage |
 | `vertex_ai/claude-opus-5` | Anthropic via Vertex AI | Heavy reasoning |
 | `vertex_ai/zai_org/glm-5.2-maas` | ZhipuAI via Vertex AI MaaS | Alternative frontier |
 
@@ -92,6 +94,27 @@ All model configuration can be driven through environment variables. The precede
   Default reasoning effort level (`low`, `medium`, `high`). Applied when no per-node `reasoning_effort` field is set.
   ```bash
   export REASONING_EFFORT="high"
+  ```
+</ParamField>
+
+<ParamField path="VERTEXAI_LOCATION" type="string">
+  Vertex AI region (e.g. `us-central1`). Falls back to `GOOGLE_CLOUD_LOCATION`, then defaults to `global` when both are absent.
+  ```bash
+  export VERTEXAI_LOCATION="us-central1"
+  ```
+</ParamField>
+
+<ParamField path="VERTEX_FLEX" type="string">
+  Set to `1` or `true` to enable Vertex AI Flex-tier routing (adds `X-Vertex-AI-LLM-Request-Type: shared` header). Alternatively, set `VERTEXAI_SERVICE_TIER=flex`.
+  ```bash
+  export VERTEX_FLEX="1"
+  ```
+</ParamField>
+
+<ParamField path="VERTEXAI_SERVICE_TIER" type="string">
+  Vertex AI service tier. Set to `flex` to enable Flex-tier routing. Equivalent to `VERTEX_FLEX=1`.
+  ```bash
+  export VERTEXAI_SERVICE_TIER="flex"
   ```
 </ParamField>
 

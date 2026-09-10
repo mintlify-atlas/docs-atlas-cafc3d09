@@ -1,5 +1,5 @@
 ---
-title: "Finding Object Schema — Mantis Pipeline Contract"
+title: "Finding Object Schema — Mantis Pipeline State Contract"
 sidebarTitle: "Finding"
 description: "Reference for the Finding object — the core state unit written to workspace/findings/<uuid>.json and progressively enriched by each Mantis pipeline skill."
 ---
@@ -169,7 +169,7 @@ These fields are written by specific downstream skills and are absent until that
 <ParamField body="repro_status" type="enum">
   The outcome of the reproduction attempt. One of:
   - `reproduced` — Reached-sink evidence is **present**. Requires `repro_file_path`, `run_command`, and `repro_output`.
-  - `statically_confirmed` — Code-path analysis confirms the sink is reachable without dynamic execution. Requires evidence fields.
+  - `statically_confirmed` — Code-path analysis confirms the sink is reachable without dynamic execution. Evidence fields should be populated when available.
   - `not_attempted` — No attempt made, or the build/environment failed (retry-eligible). Used when evidence is absent.
   - `failed_to_reproduce` — A valid harness reached the sink but the bug did not trigger.
 

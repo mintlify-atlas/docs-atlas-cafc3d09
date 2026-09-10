@@ -8,7 +8,7 @@ The `/mantis-structural-index` skill constructs a content-addressed semantic ind
 
 ## Command
 
-```
+```bash
 /mantis-structural-index [--snapshot_root <dir>] [--snapshot_id <id>] [--state_root <dir>]
 ```
 
@@ -57,7 +57,7 @@ The `/mantis-structural-index` skill constructs a content-addressed semantic ind
 
 ## On-Disk Layout
 
-```
+```text
 workspace/kb/structural_index/
 ├── manifest.json          # Atomic commit point — written LAST
 ├── catalog.sqlite         # Query-optimized serving store

@@ -1,7 +1,7 @@
 ---
 title: "/mantis-reproduce: Proof-of-Concept Crash Reproducer"
 sidebarTitle: "/mantis-reproduce"
-description: "Write and execute proof-of-concept reproducers inside isolated sandboxes to empirically verify security findings, with tiered escalation from micro-harness to full service."
+description: "Write and execute proof-of-concept reproducers in isolated sandboxes to empirically verify security findings with tiered escalation to full-service runs."
 ---
 
 Static analysis can confirm a flaw exists in code, but it cannot prove that
@@ -18,7 +18,7 @@ initial code auditing or for generating patches.
 
 ## Command
 
-```
+```text
 /mantis-reproduce [--reattack] [--finding_id=<uuid>] [--force]
                   [--target_root=<path>] [--state_root=<path>]
                   [--snapshot_root=<path>] [--snapshot_id=<id>]
@@ -98,7 +98,7 @@ initial code auditing or for generating patches.
 
 **Normal reproduction run (all eligible findings):**
 
-```
+```text
 /mantis-reproduce \
   --snapshot_root=/tmp/mantis_snapshots/pass_3 \
   --snapshot_id=abc123def456 \
@@ -107,7 +107,7 @@ initial code auditing or for generating patches.
 
 **Targeted reproduction (single finding):**
 
-```
+```text
 /mantis-reproduce \
   --finding_id=550e8400-e29b-41d4-a716-446655440000 \
   --snapshot_id=abc123def456
@@ -115,7 +115,7 @@ initial code auditing or for generating patches.
 
 **Re-attack after patching (called by `/mantis-patch`):**
 
-```
+```text
 /mantis-reproduce \
   --reattack \
   --finding_id=550e8400-e29b-41d4-a716-446655440000 \

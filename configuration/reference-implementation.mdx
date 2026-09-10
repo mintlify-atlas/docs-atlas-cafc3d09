@@ -1,5 +1,5 @@
 ---
-title: "Set Up the ADK Reference Implementation"
+title: "Set Up the Mantis ADK Reference Implementation Harness"
 sidebarTitle: "Reference Impl"
 description: "Install and configure the production-grade ADK harness in reference/: layered config, auto-detection, launch flags, and preflight validation."
 ---
@@ -145,7 +145,7 @@ Both `run.sh` and `launch.py` perform automatic auto-healing before starting: th
   LLM request timeout in seconds for this run.
 </ParamField>
 
-<ParamField path="--preflight-only / --test" type="boolean">
+<ParamField path="--preflight-only / --test / --preflight" type="boolean">
   Run preflight checks and exit without starting the campaign. Equivalent to `configure.py --test`.
   ```bash
   python3 reference/scripts/launch.py . --preflight-only

@@ -1,7 +1,7 @@
 ---
-title: "/mantis-critic: Production Viability Assessment"
+title: "/mantis-critic: Production Viability Assessment Filter"
 sidebarTitle: "/mantis-critic"
-description: "Assess whether validated findings remain exploitable in standard release builds, filtering out debug-only code, assertion traps, and compile-gated dead paths."
+description: "Assess whether validated findings remain exploitable in standard release builds, filtering out debug-only code, assertion traps, and compile-gated paths."
 ---
 
 A finding that passes `/mantis-review` is logically valid but may still be
@@ -17,7 +17,7 @@ writing reproduction scripts or patches.
 
 ## Command
 
-```
+```text
 /mantis-critic [--target_root=<path>] [--snapshot_root=<path>] [--snapshot_id=<id>] [--state_root=<path>]
 ```
 
@@ -63,7 +63,7 @@ writing reproduction scripts or patches.
 
 ## Usage
 
-```
+```text
 /mantis-critic
 ```
 
@@ -74,7 +74,7 @@ writes verdict fields in place.
 
 **With a pinned snapshot:**
 
-```
+```text
 /mantis-critic \
   --snapshot_root=/tmp/mantis_snapshots/pass_3 \
   --snapshot_id=abc123def456 \
