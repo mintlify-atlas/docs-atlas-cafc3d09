@@ -1,0 +1,164 @@
+---
+title: "Mantis Security Pipeline Architecture and Modular Design"
+sidebarTitle: "Architecture"
+description: "Learn how Mantis's modular, skill-based design separates each security review stage while sharing state through a common workspace on disk."
+---
+
+Mantis is built as a decoupled, sequential set of security review skills that can run with any AI coding agent framework. Rather than a monolithic scanner, each stage is an independent skill that reads shared state from disk, performs a focused task, and writes its results back — making the pipeline portable, replaceable, and extensible without rewriting adjacent stages. This design means you can swap out individual skills, run stages in parallel where appropriate, or integrate Mantis into an existing CI/CD pipeline with minimal overhead.
+
+## Core Design Principles
+
+The Mantis architecture rests on three foundational ideas:
+
+**Modularity.** Each stage is defined in its own `SKILL.md` file under a `mantis-<name>/` directory. Skills are loaded by any conformant agent framework — Gemini CLI, Antigravity CLI, the Google ADK reference implementation, or a custom harness. Skills communicate exclusively through shared files under `workspace/`, never through direct agent-to-agent calls.
+
+**Decoupling via shared state.** Every stage reads its inputs from well-known paths (e.g., `workspace/plan.json`, `workspace/findings/*.json`) and writes its outputs to equally well-known paths. The canonical contracts for these files are defined in `schema.json`. This means any stage can be replaced or re-run independently — the next stage will pick up from wherever the state files were left.
+
+**Stack agnosticism.** Nothing in the core pipeline is tied to a specific language, runtime, or cloud provider. The skills can be adapted for web services, compiled firmware, hardware RTL designs, IaC configurations, or ML pipelines by customizing the `SKILL.md` prompts and the threat model.
+
+## The 16 Core Pipeline Stages
+
+The pipeline executes sequentially in the following order. Three stages (history, structural-index, summarize) are optional pre-processing steps; the remainder are expected in every full run.
+
+<Steps>
+  <Step title="meta-agent — Supervisor">
+    A persistent orchestrating agent that launches the continuous review loop, monitors execution, handles errors, archives `workspace/findings/` between passes, and supports interactive steering mid-run.
+  </Step>
+  <Step title="history — VCS History Extractor (optional)">
+    Analyzes the repository's version control history to extract past vulnerabilities, security fixes, and recurring vulnerability patterns. Writes to `workspace/historical_learnings.jsonl`.
+  </Step>
+  <Step title="structural-index — Semantic Unit Index (optional)">
+    Builds a content-addressed index of semantic units (functions, classes, symbols) from source code using capability-based backend selection (SCIP/Kythe → compiler → AST → ctags → regex → grep). Writes `workspace/kb/structural_index/manifest.json` and `catalog.sqlite`. Degrades gracefully to grep when no backend is available.
+  </Step>
+  <Step title="summarize — Directory Summarizer (optional)">
+    Generates a `mantis-summary.md` file for each directory, enriched with past vulnerabilities from `workspace/historical_learnings.jsonl`. Provides a fast reference map that downstream planning stages use to skip already-analyzed areas.
+  </Step>
+  <Step title="architecture — Knowledge Base Architect">
+    Analyzes the codebase and clears the `workspace/learnings.jsonl` inbox. Synthesizes a permanent, interlinked Markdown Knowledge Base under `workspace/kb/` covering entities, data flows, and historical vulnerability classes.
+  </Step>
+  <Step title="threat-model — Threat Modeler">
+    Evaluates the entities and architecture defined in the KB to establish or refine `workspace/kb/THREAT_MODEL.md`, focusing on trust boundaries and attacker profiles.
+  </Step>
+  <Step title="plan — Strategist">
+    Reads the KB and directory summaries to build a targeted scanning roadmap in `workspace/plan.json`, with specific `kb_references` pointers for each investigation target.
+  </Step>
+  <Step title="researcher — Security Auditor">
+    Executes file-by-file triage and deep security flaw reviews using the plan and KB for context. Creates individual finding files under `workspace/findings/<uuid>.json`.
+  </Step>
+  <Step title="dedupe — Deduplicator">
+    Groups and merges overlapping or duplicate findings within `workspace/findings/`, reading `workspace/learnings.jsonl` to suppress known false patterns.
+  </Step>
+  <Step title="review — Validator">
+    Applies strict pragmatic constraints to filter false positives, updating the `status` field in each `workspace/findings/<id>.json` to `VALID`, `FALSE_POSITIVE`, `PROVISIONALLY_VALID`, or `NEEDS_RESEARCH`.
+  </Step>
+  <Step title="critic — Viability Critic">
+    Verifies that each remaining finding is triggerable in a release build (not just debug/test code), updating `production_viability` in each finding file and appending non-viable results to `workspace/learnings.jsonl`.
+  </Step>
+  <Step title="reproduce — Proof-of-Concept Developer">
+    Writes PoC reproduction scripts or raw payloads, executes them using a tiered strategy (unit micro-harness → functional subsystem → full sandboxed service) inside isolated environments (gVisor, VMs, QEMU), and updates `repro_status` in each finding file.
+  </Step>
+  <Step title="chain — Vulnerability Chainer">
+    Analyzes individually validated findings and KB primitives to construct complex multi-step exploit chains, creating new "Super Finding" files in `workspace/findings/`.
+  </Step>
+  <Step title="patch — Patcher">
+    Generates and applies minimal code fixes, runs post-patch validation inside the sandbox, performs variant-hunting re-attack (≥ 3 boundary-mutated inputs), and updates `patch_status` in each finding file.
+  </Step>
+  <Step title="calibrate — Risk Calibrator">
+    Calculates a final numerical Mantis Risk Score (1–10) for each finding based on impact, exploitability evidence, and viability, appending scores to each `workspace/findings/<id>.json`.
+  </Step>
+  <Step title="reflect — Reflector">
+    Parses agent execution trajectories, extracts false assumptions, tool failures, and successes, and appends structured insights to `workspace/learnings.jsonl` for future passes.
+  </Step>
+  <Step title="report — Reporter">
+    Generates a human-readable security review packet at `workspace/report/review_packet-latest.md` (and archives to `review_packet_pass_<N>.md`) containing verified findings, evidence, risk rationales, and patch diffs.
+  </Step>
+</Steps>
+
+## Auxiliary and Operational Skills
+
+Beyond the core pipeline stages, Mantis ships four skills that manage the pipeline itself rather than execute security analysis:
+
+<CardGroup cols={2}>
+  <Card title="/mantis-configure" icon="sliders">
+    An interactive configuration wizard and preflight validator. Manages sandbox selection (`static-only`, `microsandbox`, `gvisor`, `gce`), LLM provider options, and runs ~1s preflight tests to confirm the environment is ready.
+  </Card>
+  <Card title="/mantis-launch" icon="rocket">
+    An automated launch and healing supervisor. Validates the environment, performs preflight checks, and executes the pipeline with automatic sandbox downgrade fallback if the preferred sandbox is unavailable.
+  </Card>
+  <Card title="/mantis-advise" icon="shield">
+    A developer security advisor. Queries threat models, historical vulnerability lineages, verified patch diffs, and learned trajectory invariants from `knowledge.db` to provide contextual guidance before and during code edits.
+  </Card>
+  <Card title="/mantis-pipeline-adapter" icon="puzzle">
+    A brainstorming and guidance skill for building custom deterministic pipeline harnesses. Covers token efficiency via UUID-based referencing, MCP integration, SAST seeding, and colocated-state hazard avoidance.
+  </Card>
+</CardGroup>
+
+## The ADK Reference Implementation
+
+The `reference/` directory in the repository contains a production-grade harness built on the Google Agent Development Kit (ADK). It serves as an authoritative example of how to wire the 16-stage pipeline into a declarative, deterministic graph.
+
+```json title="reference/workflow.json (abbreviated)"
+{
+  "name": "mantis_vulnerability_pipeline",
+  "config": {
+    "default_model": "vertex_ai/gemini-3.7-flash",
+    "sandbox": { "type": "gce", "options": { "project": "YOUR_PROJECT_ID" } }
+  },
+  "nodes": [
+    { "id": "history",       "type": "agent", "skill": "../mantis-history" },
+    { "id": "structural_index", "type": "agent", "skill": "../mantis-structural-index" },
+    { "id": "summarizer",    "type": "agent", "skill": "../mantis-summarize" },
+    { "id": "architect",     "type": "agent", "skill": "../mantis-architecture" },
+    { "id": "threat_modeler","type": "agent", "skill": "../mantis-threat-model" },
+    { "id": "planner",       "type": "agent", "skill": "../mantis-plan" },
+    { "id": "researcher",    "type": "agent", "skill": "../mantis-researcher" },
+    { "id": "deduplicator",  "type": "agent", "skill": "../mantis-dedupe" },
+    { "id": "reviewer",      "type": "agent", "skill": "../mantis-review" },
+    { "id": "critic",        "type": "agent", "skill": "../mantis-critic" },
+    { "id": "reproducer",    "type": "agent", "skill": "../mantis-reproduce" },
+    { "id": "chainer",       "type": "agent", "skill": "../mantis-chain" },
+    { "id": "patcher",       "type": "agent", "skill": "../mantis-patch" },
+    { "id": "calibrator",    "type": "agent", "skill": "../mantis-calibrate" },
+    { "id": "reflector",     "type": "agent", "skill": "../mantis-reflect" },
+    { "id": "reporter",      "type": "agent", "skill": "../mantis-report" }
+  ],
+  "edges": [
+    { "from": "START",       "to": "history" },
+    { "from": "history",     "to": "structural_index" },
+    { "from": "structural_index", "to": "summarizer" },
+    { "from": "summarizer",  "to": "architect" }
+  ]
+}
+```
+
+The `workflow.json` graph is compiled by `core/graph_loader.py` into native ADK `Workflow`, `Agent`, and `Classifier` constructs. A local developer overlay (`workflow.local.json`, gitignored) holds resolved GCP project IDs, sandbox settings, and model overrides — the tracked `workflow.json` always contains clean placeholder values.
+
+The ADK reference also ships four pluggable sandbox backends:
+
+| Backend | Key | Description |
+|---|---|---|
+| `StaticOnlyEnvironment` | `"static-only"` | Safe static analysis only; dynamic reproduction is skipped |
+| `GvisorEnvironment` | `"gvisor"` | OCI container isolation via Docker/Podman with gVisor `runsc --network=none` |
+| `MicrosandboxEnvironment` | `"microsandbox"` | In-process hardware microVM via `libkrun` with no network |
+| `GceEnvironment` | `"gce"` | Hardened ephemeral GCE VM in a private VPC with DNS blackholing and IAP tunneling |
+
+<Note>
+The ADK reference implementation is one conformant harness. Any harness that reads and writes the `schema.json` contracts and implements the pass lifecycle (sync → pin → run stages → archive) is equally valid.
+</Note>
+
+## Skills Reference
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Flow" icon="arrow-right" href="/concepts/pipeline-flow">
+    Sequential execution order with per-stage inputs, outputs, and workspace paths
+  </Card>
+  <Card title="Workspace State" icon="folder" href="/concepts/workspace-state">
+    Full `workspace/` directory structure and the inter-stage data contract
+  </Card>
+  <Card title="Snapshot Model" icon="camera" href="/concepts/snapshot-model">
+    Opt-in pinned-snapshot model for continuous reviews of living codebases
+  </Card>
+  <Card title="Skills Reference" icon="book" href="/skills/mantis-history">
+    Per-skill specifications, inputs, outputs, and configuration options
+  </Card>
+</CardGroup>

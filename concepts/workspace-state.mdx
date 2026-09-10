@@ -1,0 +1,245 @@
+---
+title: "Mantis Workspace Directory Structure and State Files"
+sidebarTitle: "Workspace State"
+description: "A complete reference for the workspace/ directory structure, every state file Mantis reads and writes, and the inter-stage data contract pattern."
+---
+
+Every Mantis stage communicates exclusively through files on disk. There is no shared memory, no direct agent-to-agent messaging, and no hidden state. The `workspace/` directory is the single source of truth for the pipeline's current state, and each file within it has a well-defined owner (the stage that writes it) and a set of consumers (the stages that read it). This design makes the pipeline inspectable, resumable, and replaceable — you can stop after any stage, edit the state files by hand or with a script, and resume from the next stage without any special handling.
+
+The canonical schemas for all machine-readable state files are defined in `schema.json` at the repository root. Harness authors and pipeline orchestrators should validate their state files against the corresponding sub-schemas before running downstream stages.
+
+## Directory Overview
+
+```text
+workspace/
+├── .mantis_state.json              # Orchestrator state (pass number, snapshot info)
+├── plan.json                       # Scanning roadmap written by /mantis-plan
+├── learnings.jsonl                 # Ephemeral insights inbox (cleared by /mantis-architecture)
+├── historical_learnings.jsonl      # VCS history learnings (written by /mantis-history)
+├── findings/
+│   ├── <uuid>.json                 # One file per discovered vulnerability
+│   └── ...
+├── kb/
+│   ├── THREAT_MODEL.md             # Living threat model (Markdown, non-JSON contract)
+│   ├── entities/                   # Per-entity Markdown files
+│   ├── data_flows/                 # Trust boundary and data-flow Markdown files
+│   ├── structural_index/
+│   │   ├── manifest.json           # Index metadata and backend info
+│   │   └── catalog.sqlite          # Queryable semantic unit catalog
+│   └── structural_index.jsonl      # Compatibility pointer to the index
+├── helpers/
+│   └── query_structural_index.py   # Bounded, paginated query interface for the index
+├── report/
+│   ├── review_packet-latest.md     # Latest human-readable security report
+│   └── review_packet_pass_<N>.md   # Per-pass archived reports
+└── archive/
+    ├── findings_pass_<N>/          # Archived findings from completed passes
+    └── loop<N>_findings/           # Legacy archive path (older harnesses)
+```
+
+## State Files Reference
+
+### `workspace/.mantis_state.json`
+
+The orchestrator state file is written and read by `/mantis-meta-agent` and the pipeline harness. It tracks the pass lifecycle, snapshot pinning, and VCS information across rounds. Validate against the `#/$defs/state` sub-schema in `schema.json`.
+
+<Accordion title="Key fields">
+  | Field | Type | Description |
+  |---|---|---|
+  | `pass_number` | integer | Current sequential pass number |
+  | `last_updated` | ISO 8601 string | When the state was last written |
+  | `vcs_info` | object | VCS type, commit hash, branch, dirty flag, and snapshot ID |
+  | `active_snapshot` | object | Pinned snapshot root, snapshot ID, `snapshot_pinned` boolean, and pass number |
+  | `snapshot_history` | array | Append-only log of one entry per pinned pass; never overwritten |
+  | `kb_snapshot_id` | string | Snapshot ID the KB was last built against; used to detect stale KB after sync |
+  | `changed_files` | array | Hint-only list of files that changed since the previous snapshot |
+  | `changed_files_status` | `COMPUTED` \| `UNKNOWN` | Whether `changed_files` is a trustworthy diff |
+</Accordion>
+
+<Note>
+`active_snapshot` is optional and backward-compatible. When absent, the pipeline runs in MODE-OFF (today's single-static-snapshot behavior, all verdicts permitted). When present with `snapshot_pinned: false`, the pipeline runs in HALT mode (degraded, no authoritative verdicts).
+</Note>
+
+### `workspace/findings/<uuid>.json`
+
+One file per discovered vulnerability. This is the core state unit of the pipeline — it is created by `/mantis-researcher` and progressively enriched by every subsequent stage. Validate against `#/$defs/finding` in `schema.json`.
+
+<Accordion title="Key fields by lifecycle stage">
+  **Written at creation by `/mantis-researcher`:**
+
+  | Field | Description |
+  |---|---|
+  | `id` | UUIDv4 matching the filename |
+  | `title` | Concise vulnerability summary |
+  | `description` | Detailed explanation of the flaw |
+  | `code_paths` | Exact file:line locations (e.g., `src/auth.c:145`) |
+  | `impact` | Potential consequence |
+  | `severity` | `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` |
+  | `attacker_position` | `EXTERNAL` / `INTERNAL_NETWORK` / `LOCAL` / etc. |
+  | `privileges_required` | `NONE` / `LOW` / `HIGH` |
+  | `user_interaction` | `NONE` / `REQUIRED` |
+  | `status` | Initial validity (`PROVISIONALLY_VALID` / `NEEDS_RESEARCH`) |
+  | `history` | Chronological log of stage actions |
+  | `discovery_commit` | SNAPSHOT_ID when the finding was first discovered (written once, preserved verbatim) |
+  | `signature` | Deterministic stable hash of `normalized_title + cwe + primary_target` |
+  | `lineage_id` | UUID linking this finding to the same bug across passes |
+
+  **Added by `/mantis-review`:**
+  `status` (updated), `reasoning`, `triage_checklist`
+
+  **Added by `/mantis-critic`:**
+  `production_viability`, `critic_reasoning`
+
+  **Added by `/mantis-reproduce`:**
+  `repro_status`, `repro_file_path`, `run_command`, `repro_output`
+
+  **Added by `/mantis-patch`:**
+  `patch_status`, `patch_diff`, `reattack_status`, `reattack_file_path`, `reattack_run_command`, `reattack_output`, `reattack_variants`
+
+  **Added by `/mantis-calibrate`:**
+  `impact_score`, `likelihood_score`, `mantis_risk_score`, `priority`, `inferred_exposure`, `calibration_checklist`, `outrage_commentary`, `executive_summary`
+</Accordion>
+
+```json title="Minimal finding file (as created by /mantis-researcher)"
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "title": "SQL Injection in user search endpoint",
+  "description": "User-controlled input is concatenated directly into a SQL query at src/api/users.py:87 without parameterization.",
+  "code_paths": ["src/api/users.py:87"],
+  "impact": "Unauthenticated database read/write; potential for data exfiltration or authentication bypass.",
+  "severity": "CRITICAL",
+  "attacker_position": "EXTERNAL",
+  "privileges_required": "NONE",
+  "user_interaction": "NONE",
+  "mitigation": "Use parameterized queries or an ORM-level query builder.",
+  "status": "PROVISIONALLY_VALID",
+  "history": [
+    {
+      "stage": "researcher",
+      "action": "created",
+      "details": "Initial finding from file-by-file triage of src/api/users.py",
+      "pass_number": 1,
+      "timestamp": "2025-01-15T10:23:45Z"
+    }
+  ],
+  "discovery_commit": "abc123def456"
+}
+```
+
+### `workspace/plan.json`
+
+Written by `/mantis-plan` and read by `/mantis-researcher`. Contains an `investigations` array, each entry specifying `title`, `target_files`, `kb_references`, and `question` (detailed researcher instructions). Validate against `#/$defs/plan` in `schema.json`.
+
+### `workspace/learnings.jsonl`
+
+An ephemeral JSONL inbox of structured insights. Each line is a JSON object conforming to one of the three `learning_entry` variants in `schema.json`:
+
+<Tabs>
+  <Tab title="trajectory_insight">
+    Written by `/mantis-reflect`, `/mantis-critic`, and `/mantis-patch`. Records observations about agent behavior, tool failures, and successful strategies.
+
+    ```json
+    {
+      "type": "trajectory_insight",
+      "action": "add",
+      "target_entity": "src/auth/token.py",
+      "insight": "JWT expiry check is skipped when the 'debug' header is present — flagged as non-viable in release build.",
+      "source_stage": "critic",
+      "snapshot": "abc123def456"
+    }
+    ```
+  </Tab>
+  <Tab title="finding_outcome">
+    Written by `/mantis-critic` and `/mantis-patch`. Records the final outcome of a finding for future deduplication.
+
+    ```json
+    {
+      "title": "Buffer overflow in packet parser",
+      "code_paths": ["src/net/parser.c:214"],
+      "status": "VERIFIED_SECURE",
+      "patch_base_snapshot": "abc123def456",
+      "snapshot": "abc123def456"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+`workspace/learnings.jsonl` is **cleared** by `/mantis-architecture` at the start of each pass after it reads and ingests the entries into the KB. Do not rely on this file for long-term storage — use `workspace/historical_learnings.jsonl` for persistent cross-pass records.
+</Warning>
+
+### `workspace/historical_learnings.jsonl`
+
+Written by `/mantis-history` and read by `/mantis-summarize` and `/mantis-architecture`. Contains historical vulnerability entries extracted from VCS commit history. Unlike `learnings.jsonl`, this file is **not cleared** between passes — it is a permanent record of the repository's security history.
+
+Each entry conforms to the `learning_entry / Historical Learning Entry` schema variant and includes `revision_id`, `title`, `description`, `code_paths`, `vuln_type`, `mitigation_diff`, `cve`, and `history`.
+
+### `workspace/kb/`
+
+A Markdown Knowledge Base written by `/mantis-architecture` and `/mantis-threat-model`, and read by every subsequent analytical stage. The KB is not a JSON file — it is a collection of interlinked Markdown documents.
+
+<Accordion title="KB sub-directory structure">
+  | Path | Written by | Content |
+  |---|---|---|
+  | `workspace/kb/THREAT_MODEL.md` | `/mantis-threat-model` | Living threat model — trust boundaries, attacker profiles, high-risk assets |
+  | `workspace/kb/entities/` | `/mantis-architecture` | Per-entity Markdown files describing components, their roles, and known vulnerability classes |
+  | `workspace/kb/data_flows/` | `/mantis-architecture` | Trust boundary crossings, data ingress/egress points, and serialization formats |
+
+  The `THREAT_MODEL.md` file is a **non-JSON contract** with mandatory sections: System Overview Summary, Deployment Intent, Trust Boundaries, Threat Actors & Vectors, and High-Risk Assets & Criticality.
+</Accordion>
+
+### `workspace/kb/structural_index/`
+
+Written by `/mantis-structural-index` (optional stage). Contains a content-addressed index of semantic units queryable via `workspace/helpers/query_structural_index.py`.
+
+| File | Description |
+|---|---|
+| `manifest.json` | Index metadata: backend used, partition count, creation timestamp, snapshot ID |
+| `catalog.sqlite` | Queryable symbol catalog with bounded, paginated lookup |
+| `../structural_index.jsonl` | Compatibility pointer (one line) for consumers that pre-date the `manifest.json` layout |
+
+<Note>
+The structural index is hint-only. Consumers that cannot load it fall back to grep automatically. The index never gates findings — a missing index causes degraded performance, not incorrect results.
+</Note>
+
+### `workspace/report/review_packet-latest.md`
+
+Written by `/mantis-report`. The final human-readable security review packet for the current pass. Also archived to `workspace/report/review_packet_pass_<N>.md` for historical reference. This file should be reviewed by a security expert before any findings are reported to maintainers.
+
+## The Inter-Stage Data Contract Pattern
+
+Every stage in the Mantis pipeline follows a strict **read → process → write** contract:
+
+```text
+Stage N
+  ├── READ:    Defined input files from workspace/ (schema-validated)
+  ├── PROCESS: AI agent performs its focused task
+  └── WRITE:   Defined output files to workspace/ (schema-validated)
+
+Stage N+1
+  ├── READ:    Outputs written by Stage N (and earlier stages)
+  └── ...
+```
+
+This pattern has several important properties:
+
+**Resumability.** If a stage fails mid-run, you can fix the issue and re-run that stage without re-running earlier stages. The pipeline picks up from the last successfully written state.
+
+**Replaceability.** Any stage can be replaced by a deterministic script, an external tool, or a different AI model, as long as it reads the expected input paths and writes schema-conformant output files. The `/mantis-pipeline-adapter` skill documents common patterns for this.
+
+**Inspectability.** At any point in the pipeline, you can `cat workspace/findings/*.json` or `cat workspace/plan.json` to see exactly what state each stage left behind.
+
+**Schema enforcement.** `schema.json` is the canonical contract. Harnesses should validate finding files against `#/$defs/finding` before passing them to downstream stages to catch schema drift early.
+
+<Tip>
+In a programmatic harness, replace the LLM's one-off Python scripts for state management with native tool calls or functions that perform direct JSON reads and writes. This eliminates the risk of the LLM misreading or corrupting state files.
+</Tip>
+
+## Backward Compatibility
+
+All fields introduced for the snapshot model are optional. Existing `workspace/` directories created by pre-snapshot Mantis versions validate unchanged against the current `schema.json` — no new `required` field or `allOf` gate was added. Absent fields always route to the safe branch:
+
+- `discovery_commit` absent → Snapshot Match Check NOT_MATCHED → re-research, never silently trust a prior verdict
+- `active_snapshot` absent → MODE-OFF → all verdicts permitted (today's behavior)
+- `signature` absent → fall back to UUID-based deduplication
+- `lineage_id` absent → fall back to `id` (UUID) for finding identity

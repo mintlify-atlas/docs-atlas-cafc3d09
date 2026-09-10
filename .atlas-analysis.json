@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Mantis",
+  "projectType": "ai-ml",
+  "projectName": "Mantis",
+  "projectDescription": "A modular, stack-agnostic toolkit of security review skills for AI coding agents to autonomously find, reproduce, and patch vulnerabilities.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#fc443c",
-    "light": "#079e4f",
-    "dark": "#048dee"
-  },
-  "favicon": "https://media.brand.dev/80aedd2f-7575-49d0-bed3-7b7f91d88ea9.png",
-  "logo": {
-    "light": "https://media.brand.dev/7eb33534-fc08-4e47-a5ca-c0b4487a0298.svg",
-    "dark": "https://media.brand.dev/7eb33534-fc08-4e47-a5ca-c0b4487a0298.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/google/mantis"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/google/mantis"
-    }
-  },
+  "primaryColor": "#fc443c",
+  "lightColor": "#079e4f",
+  "darkColor": "#048dee",
   "navigation": {
     "tabs": [
       {
@@ -137,5 +120,51 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "16-stage modular security review pipeline (history → report)",
+    "Platform-agnostic: works with Gemini CLI, Antigravity CLI, Google ADK, and custom harnesses",
+    "Pluggable sandbox environments: static-only, gVisor, MicroSandbox, and GCE",
+    "Tiered vulnerability deduplication using exact heuristics, RCA normalization, and semantic embeddings",
+    "Snapshot-per-pass model for continuous reviews of living codebases",
+    "SAST tool ingestion via a platform-agnostic JSONL IR adapter",
+    "Automated exploit chain construction combining multiple low-severity findings",
+    "Patch generation with re-attack variant testing for VERIFIED_SECURE status",
+    "Risk calibration using a Mantis Risk Score matrix (1–10)",
+    "ADK reference implementation with declarative workflow graph and layered config overlay",
+    "Specialized domain support: RTL/hardware, IaC, ML pipelines, compiled firmware",
+    "OKF v0.2 knowledge format with bi-directional bundle import/export"
+  ],
+  "publicApiSurface": [
+    "/mantis-history",
+    "/mantis-structural-index",
+    "/mantis-summarize",
+    "/mantis-architecture",
+    "/mantis-threat-model",
+    "/mantis-plan",
+    "/mantis-researcher",
+    "/mantis-dedupe",
+    "/mantis-review",
+    "/mantis-critic",
+    "/mantis-reproduce",
+    "/mantis-chain",
+    "/mantis-patch",
+    "/mantis-calibrate",
+    "/mantis-reflect",
+    "/mantis-report",
+    "/mantis-meta-agent",
+    "/mantis-advise",
+    "/mantis-configure",
+    "/mantis-launch",
+    "/mantis-pipeline-adapter",
+    "npx skills add google/mantis",
+    "reference/scripts/configure.py",
+    "reference/scripts/launch.py (./run.sh)",
+    "reference/scripts/advise.py",
+    "workspace/findings/<uuid>.json (Finding schema)",
+    "workspace/plan.json (Plan schema)",
+    "workspace/.mantis_state.json (State schema)",
+    "workspace/learnings.jsonl (LearningEntry schema)",
+    "schema.json (canonical pipeline state contract)"
+  ]
 }

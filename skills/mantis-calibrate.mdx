@@ -1,0 +1,285 @@
+---
+title: "/mantis-calibrate: Vulnerability Risk Score Calculator"
+sidebarTitle: "/mantis-calibrate"
+description: "Converts raw security findings into prioritized, scored risk reports using a structured risk matrix with impact, likelihood, and context multipliers."
+---
+
+The `/mantis-calibrate` skill is the final scoring stage of the Mantis pipeline. It reads every finding that has been fully processed by upstream stages and appends a rigorous, evidence-based risk score to each file. Use it after the patch and reproduce stages have run to turn raw finding data into actionable, prioritized output. Do not use it to discover new vulnerabilities, write patches, or analyze source code — it is a **findings-only** stage that never needs to read the live target tree.
+
+## Command
+
+```text
+/mantis-calibrate
+```
+
+This skill takes no positional arguments. All configuration is resolved from `workspace/.mantis_state.json` and the individual finding files in `workspace/findings/`.
+
+## Input / Output Contract
+
+**Reads:**
+
+| Path | Purpose |
+|---|---|
+| `workspace/findings/*.json` | All active finding files; each contains the full pipeline state including `repro_status` and `production_viability` |
+| `workspace/kb/THREAT_MODEL.md` | (Optional) Component exposure tiers, asset criticality, trust boundary overrides, and `Calibration Overrides` declarations |
+| `workspace/.mantis_state.json` | Current `pass_number` and `active_snapshot` (`snapshot_id`, `snapshot_pinned`, `root`) for provenance stamping |
+
+**Writes (in-place updates to each finding file):**
+
+| Field | Type | Description |
+|---|---|---|
+| `impact_score` | `1–5` | CIA triad impact rating |
+| `likelihood_score` | `1–5` | Exploitability / probability rating |
+| `availability_tier` | `CRITICAL \| STANDARD \| LOW_CRITICALITY \| null` | DoS-relevant criticality from threat model |
+| `inferred_exposure` | `EXPOSED \| INTERNAL \| PRIVILEGED` | Resolved network/trust exposure |
+| `attacker_position` | enum string | Normalized to the canonical attacker position enum |
+| `mantis_risk_score` | `0.1–10.0` | Final Hazard score |
+| `priority` | `CRITICAL \| HIGH \| MEDIUM \| LOW` | Qualitative priority bucket |
+| `sanity_triage_applied` | string | Semicolon-separated list of fired sanity cap rules |
+| `calibration_checklist` | object | Outcome (`APPLIES \| DOES_NOT_APPLY \| UNKNOWN`) for all 27 sanity rules |
+| `outrage_commentary` | string | Reasoning on reputational / outrage factor |
+| `executive_summary` | string | Human-readable risk summary |
+| `history[]` | array entry | Provenance stamp with stage, pass, snapshot ID, and timestamp |
+
+**Also writes:** `workspace/helpers/append_calibrate.py` — a reusable helper script (versioned `# MANTIS_HELPER_VERSION = 2`) used to apply all field updates without re-emitting entire JSON objects.
+
+**Preconditions:** Confirmed or raw findings must exist in `workspace/findings/`. The skill degrades gracefully when `THREAT_MODEL.md` is absent.
+
+**Idempotency:** Updates findings in place by overwriting existing keys. Running multiple times on the same inputs yields identical output; no duplicate `history` entries are created.
+
+## The Risk Score Formula
+
+Calibrate computes a **Hazard** score as the primary numeric output, then comments on **Outrage** as qualitative context:
+
+```text
+Hazard = (Impact + Likelihood) × Multiplier     [capped at 10.0]
+Risk   = Hazard + Outrage                        [outrage is commentary only, not in the number]
+```
+
+<Note>
+The Outrage factor — reputational damage, user sentiment fallout — is discussed in `outrage_commentary` but is **never added to the numeric `mantis_risk_score`**. The score is purely the Hazard calculation.
+</Note>
+
+### Impact Score (1–5)
+
+Rates the CIA triad impact, strictly bounded by blast radius:
+
+<Accordion title="Impact scale definitions">
+
+| Score | Meaning |
+|---|---|
+| **5** | Complete systemic loss of Confidentiality (full data breach, root key leak) or Integrity (clear RCE by an unprivileged attacker). MUST NOT be used when the attacker already has execution privileges. |
+| **4** | Substantial loss: systemic Availability loss (total service outage) or major data exposure. Security control bypass that leads to systemic compromise also warrants at least 4. |
+| **3** | Moderate loss: partial data exposure, temporary disruption. Requires LOW privileges unless it leads to systemic compromise. |
+| **2** | Minor loss: minor information leak, localized disruption. A vulnerability affecting **only a single user's own data** MUST NOT exceed 2 (unless non-repudiation is violated or other users are affected). HIGH-privilege exploits (admin-to-super-admin) are also capped at 2. |
+| **1** | Negligible: cosmetic, fragile code, purely theoretical hygiene. Findings of the type "lack of defense-in-depth" or "the code is fragile" MUST have Impact = 1. |
+
+**Security Control Bypass upgrade:** If the vulnerability directly bypasses a core security control (authentication, authorization, cryptographic signature verification), elevate Impact to at least **4** (or **5** for systemic compromise), even if the immediate technical impact looks limited.
+
+</Accordion>
+
+### Likelihood Score (1–5)
+
+Rates proven exploitability, not theoretical difficulty:
+
+<Accordion title="Likelihood scale definitions">
+
+| Score | Meaning |
+|---|---|
+| **5** | Actively exploited in the wild, OR the agent produced a functional, weaponized exploit. |
+| **4** | Public PoC exists, OR a highly plausible but partially weaponized exploit was produced. |
+| **3** | No functional exploit, but the attack vector is trivial to automate. |
+| **2** | Theoretical and highly complex (requires local access, strict timing conditions). |
+| **1** | Strictly theoretical; no known exploit path. |
+
+**Reachability-in-Practice Modifier:** Reduce `likelihood_score` by 1–2 (floor 1) when the exploit path relies on rare API calls, uncommon configuration fields, or non-default/administrative-only configurations that are rarely enabled in production.
+
+</Accordion>
+
+### Context Multiplier (0.1–1.0)
+
+The multiplier folds in network exposure, asset criticality, user interaction, and production viability. Key rules:
+
+<Accordion title="Exposure and viability multiplier rules">
+
+**By exposure / attacker position:**
+- Exposed Interface / direct untrusted access → **1.0**
+- Internal Component / semi-trusted parsed data → **0.8** (default when threat model is missing)
+- Privileged / Trusted Zone → **0.5**
+
+**By production viability:**
+- `VIABLE` or `CONDITIONAL_VIABLE` → standard multiplier applies
+  - `CONDITIONAL_VIABLE` applies an additional **0.7** scaling factor (requires specific non-default conditions)
+- `SAMPLE_OR_TEST` → applies an additional **0.4** scaling factor (bug is in sample code, not production)
+- `FALSE_POSITIVE` or `NON_VIABLE` → **skip entirely** (do not write any calibration fields)
+
+**User interaction:**
+- `user_interaction: REQUIRED` → apply an additional **0.7** scaling factor (e.g., CSRF, Clickjacking)
+
+**DoS / Availability-only:**
+- Component `availability_tier: LOW_CRITICALITY` → multiplier reduced to **0.5**
+- `availability_tier: STANDARD` → reduced to **0.8**
+- `availability_tier: CRITICAL` → remains **1.0**
+
+**Dead code:**
+- Static/dynamic analysis proves the code is never called at runtime → reduce multiplier to **0.2**
+
+</Accordion>
+
+## Priority Thresholds
+
+| Priority | Score Range | Conditions |
+|---|---|---|
+| **CRITICAL** | 8.0–10.0 | MUST represent clear RCE (or equivalent total loss) by an unprivileged attacker (`privileges_required: NONE`) with zero user interaction. DoS findings only qualify when `availability_tier: CRITICAL` AND no auto-recovery exists. |
+| **HIGH** | 6.0–7.9 | Significant hazard; needs prompt resolution. |
+| **MEDIUM** | 3.0–5.9 | Moderate hazard; can be scheduled. |
+| **LOW** | 0.1–2.9 | Minimal hazard. Fragile / hygiene / single-user-data findings are **always capped** at LOW regardless of calculated score. |
+
+## The 27 Sanity Triage Rules
+
+After the initial score calculation, calibrate applies a second-pass sanity check across 27 rules organized into three severity-cap categories. The most restrictive rule wins.
+
+<Tabs>
+  <Tab title="Category A — Force to LOW (≤ 2.0)">
+    | Rule key | Trigger |
+    |---|---|
+    | `repro_failure` | Reproduction failed or was not attempted (with STALE\_EVIDENCE carve-out for snapshot-mismatched findings) |
+    | `unreachable_inputs` | Inputs documented as highly unlikely to be user-controlled |
+    | `third_party_reachability` | Dependency CVE with no proven reachable path from application input |
+    | `minor_config_hygiene` | Minor deviation from best practice with no clear exploit path |
+    | `non_security_critical` | Affects components or data with no security sensitivity |
+    | `vague_code_paths` | Relies on unverified assumptions about caller behavior (with STALE\_EVIDENCE carve-out) |
+    | `unreliable_triggers` | Triggers indistinguishable from normal operations |
+    | `prerequisite_shell` | Attacker already has local shell at the same or higher privilege level (no marginal gain) |
+    | `physical_long_term` | Requires specialized laboratory equipment or long-term physical possession |
+    | `trusted_controller_zero_delta` | Controller-mediated interface where the exploit grants zero marginal capability |
+    | `standard_host_attacks` | `HOST_SYSTEM` attacker position on non-Confidential Computing deployments |
+  </Tab>
+  <Tab title="Category B — Cap at HIGH (≤ 7.9)">
+    | Rule key | Trigger |
+    |---|---|
+    | `static_confirmation` | `repro_status: statically_confirmed` — caps `likelihood_score` at 3 and applies 0.8 Hazard multiplier (trace-lift exception for external sanitizer / crash-log evidence; suppressed under STALE\_EVIDENCE) |
+    | `strict_xss` | All XSS; default MEDIUM/LOW, cap HIGH only for stored XSS on critical admin pages with zero-click |
+    | `internal_nested` | Network/Trust Exposure multiplier < 1.0 and score lands in CRITICAL range |
+    | `probabilistic_llm` | Attack relies on probabilistic LLM behavior (prompt injection, jailbreak) |
+    | `supply_chain_prerequisites` | Exploit requires supply-chain position or write access to build pipeline |
+    | `non_default_config` | Only exploitable under non-default configurations |
+    | `confidential_computing_host` | `HOST_SYSTEM` attacker on Confidential Computing deployments |
+    | `trusted_controller_critical_bypass` | Controller can bypass target-side documented security controls or safety-of-life limits |
+  </Tab>
+  <Tab title="Category C — Cap at MEDIUM (≤ 5.9)">
+    | Rule key | Trigger |
+    |---|---|
+    | `local_attack_vector` | Requires local shell access without VM escape |
+    | `self_contained_blast` | Maximum impact is confined to resources the triggering principal already owns |
+    | `rarely_exposed` | Component documented as rarely exposed or unlikely to be user-controlled |
+    | `equivalent_primitives` | Attacker already has equivalent access through standard system features |
+    | `documented_insecure_config` | Non-default config explicitly documented as insecure/diagnostic |
+    | `physical_temporary` | Requires temporary physical access (USB insertion, evil maid) |
+    | `high_privilege_external` | `attacker_position: EXTERNAL` but requires `privileges_required: HIGH` |
+    | `trusted_controller_standard_bypass` | Controller bypasses standard safety/sanity limits (not security-critical) |
+  </Tab>
+</Tabs>
+
+<Note>
+**UNKNOWN rule policy:** If a rule's outcome cannot be determined, it is marked `UNKNOWN` and its cap is **not applied** (score-conservative). The `sanity_triage_applied` string is prefixed with `Incomplete Calibration (UNKNOWN: <rule_name>)` to flag that manual review is required.
+</Note>
+
+<Warning>
+**Threat model overrides take precedence.** If `workspace/kb/THREAT_MODEL.md` defines a `Calibration Overrides` block (e.g., `LIFT_CAP: PHYSICAL_LONG_TERM`), the corresponding sanity cap is lifted for the matching finding or component. Override declarations always win over the default rules above.
+</Warning>
+
+## Snapshot Provenance & STALE-EVIDENCE Guard
+
+Calibrate operates in one of three modes depending on the `active_snapshot` state:
+
+<Tabs>
+  <Tab title="MODE-OFF (default)">
+    `active_snapshot` is absent in state. Calibrate scores exactly as today — runs every heuristic, no STALE\_EVIDENCE tokens emitted, byte-for-byte backward-compatible behavior.
+  </Tab>
+  <Tab title="PINNED">
+    `active_snapshot.snapshot_pinned == true`. Full provenance tracking: each finding's `discovery_commit` is compared to `active_snapshot.snapshot_id`. Findings that are NOT_MATCHED (stale) have their four guarded heuristics suppressed — dead-code reduction, `repro_failure`, `vague_code_paths`, and the `static_confirmation` trace-lift. The literal token `STALE_EVIDENCE` is prepended to `sanity_triage_applied`.
+  </Tab>
+  <Tab title="HALT">
+    `active_snapshot.snapshot_pinned == false`. The tree could not be pinned. Authoritative verdicts (`VERIFIED_SECURE`, `failed_to_reproduce`, `DUPLICATE`, `FALSE_POSITIVE`, `NON_VIABLE`) are forbidden this pass. STALE-EVIDENCE guard applies conservatively.
+  </Tab>
+</Tabs>
+
+## Usage
+
+The skill is typically invoked by the meta-agent as Stage 12, after the patch/verify stage:
+
+```text
+/mantis-calibrate
+```
+
+In a custom harness, pass the three roots when snapshot pinning is active:
+
+```text
+/mantis-calibrate --snapshot_root=<active_snapshot.root> --snapshot_id=<active_snapshot.snapshot_id> --state_root=<workspace parent>
+```
+
+**Batch processing:** When many findings exist, calibrate splits work into batches. If subagents are available, each batch is delegated in parallel. Every subagent must receive the same `--snapshot_root` and `--state_root` arguments so all code inspections read the same pinned copy.
+
+## calibration_checklist JSON Schema
+
+Each finding is updated with a `calibration_checklist` object containing an entry for all 27 rules:
+
+```json
+{
+  "calibration_checklist": {
+    "repro_failure": {
+      "outcome": "APPLIES | DOES_NOT_APPLY | UNKNOWN",
+      "reason": "<string — required when outcome is APPLIES or UNKNOWN>"
+    },
+    "unreachable_inputs": { "outcome": "DOES_NOT_APPLY" },
+    "third_party_reachability": { "outcome": "DOES_NOT_APPLY" },
+    "minor_config_hygiene": { "outcome": "DOES_NOT_APPLY" },
+    "non_security_critical": { "outcome": "DOES_NOT_APPLY" },
+    "vague_code_paths": { "outcome": "DOES_NOT_APPLY" },
+    "unreliable_triggers": { "outcome": "DOES_NOT_APPLY" },
+    "prerequisite_shell": { "outcome": "DOES_NOT_APPLY" },
+    "physical_long_term": { "outcome": "DOES_NOT_APPLY" },
+    "trusted_controller_zero_delta": { "outcome": "DOES_NOT_APPLY" },
+    "standard_host_attacks": { "outcome": "DOES_NOT_APPLY" },
+    "static_confirmation": { "outcome": "APPLIES", "reason": "repro_status is statically_confirmed" },
+    "strict_xss": { "outcome": "DOES_NOT_APPLY" },
+    "internal_nested": { "outcome": "DOES_NOT_APPLY" },
+    "probabilistic_llm": { "outcome": "DOES_NOT_APPLY" },
+    "supply_chain_prerequisites": { "outcome": "DOES_NOT_APPLY" },
+    "non_default_config": { "outcome": "DOES_NOT_APPLY" },
+    "confidential_computing_host": { "outcome": "DOES_NOT_APPLY" },
+    "trusted_controller_critical_bypass": { "outcome": "DOES_NOT_APPLY" },
+    "local_attack_vector": { "outcome": "DOES_NOT_APPLY" },
+    "self_contained_blast": { "outcome": "DOES_NOT_APPLY" },
+    "rarely_exposed": { "outcome": "DOES_NOT_APPLY" },
+    "equivalent_primitives": { "outcome": "DOES_NOT_APPLY" },
+    "documented_insecure_config": { "outcome": "DOES_NOT_APPLY" },
+    "physical_temporary": { "outcome": "DOES_NOT_APPLY" },
+    "high_privilege_external": { "outcome": "DOES_NOT_APPLY" },
+    "trusted_controller_standard_bypass": { "outcome": "DOES_NOT_APPLY" }
+  }
+}
+```
+
+<Info>
+For backward compatibility, the schema also accepts `"fires": <bool>` per rule (with `reason` required only when `fires` is `true`). The `"outcome"` format is preferred in new pipelines.
+</Info>
+
+## Notes
+
+<Note>
+**Token optimization:** Calibrate writes a reusable helper script `workspace/helpers/append_calibrate.py` on the first finding and reuses it for all subsequent findings. It never re-emits the entire JSON object. Before reusing an existing helper, it checks that the first line is exactly `# MANTIS_HELPER_VERSION = 2`; if not, it regenerates the script from scratch.
+</Note>
+
+<Warning>
+**Findings skipped entirely:** Any finding whose `status` is `FALSE_POSITIVE` or `NEEDS_RESEARCH`, or whose `production_viability` is `NON_VIABLE`, is **not scored**. Calibrate writes no fields to these files.
+</Warning>
+
+<Note>
+**Missing field fallbacks:** If `production_viability` is absent, it is treated as `CONDITIONAL_VIABLE`. If `repro_status` is absent, it is treated as `not_attempted` (which triggers the `repro_failure` sanity cap unless STALE-EVIDENCE is active).
+</Note>
+
+<Tip>
+**Threat model overrides are powerful.** Adding a `Calibration Overrides` section to `workspace/kb/THREAT_MODEL.md` lets you lift caps for specific positions or components — for example, lifting the `physical_long_term` Force-LOW for embedded firmware where physical access is the expected attack surface.
+</Tip>

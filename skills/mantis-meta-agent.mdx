@@ -1,0 +1,212 @@
+---
+title: "/mantis-meta-agent: Continuous Campaign Supervisor"
+sidebarTitle: "/mantis-meta-agent"
+description: "Persistent supervisor driving the multi-pass Mantis loop: syncs targets, pins snapshots, delegates all pipeline stages, and archives findings each pass."
+---
+
+The `/mantis-meta-agent` skill is the top-level orchestrator of the Mantis security review pipeline. It maintains a continuous, multi-pass review loop — synchronizing the target codebase, pinning immutable snapshots, delegating each of the 16 pipeline stages to specialized subagents in order, archiving findings at pass boundaries, and immediately beginning the next pass. Use it when you need a long-running, autonomous security review campaign with multi-pass continuity, regression detection, and progressive knowledge accumulation. Do not use it to execute individual review stages directly — it delegates all analysis to specialized subagents and never performs auditing or patching itself.
+
+## Command
+
+```text
+/mantis-meta-agent
+```
+
+### Flags
+
+<ParamField path="--sync" type="flag">
+  **OPT-IN** boundary sync and snapshot pinning. When present, the meta-agent synchronizes the target with its upstream at the start of each pass (Block C) and pins an immutable per-pass snapshot (Block D). When absent (the default), the pass runs against the live tree exactly as today — `active_snapshot` and `snapshot_history` are not written, and `snapshot_pinned` is left unset. Preserves single-snapshot backward-compatible behavior byte-for-byte.
+</ParamField>
+
+<ParamField path="--snapshot_keep" type="integer" default="2">
+  Number of pinned snapshot directories to retain under `<state_root>/.mantis_snapshots/`. Default is 2 (current pass + previous pass). Raise this value when you need to rebase patches or PoCs against a finding's original discovery snapshot from earlier passes.
+</ParamField>
+
+<ParamField path="--state_root" type="absolute path">
+  Directory that contains `workspace/` and `.mantis_snapshots/`. Defaults to the absolute path of the current working directory at meta-agent launch (i.e., the parent of `workspace/`).
+
+  **Colocated state warning:** If `state_root` resolves inside `CODE_ROOT` (the default when launching from inside the target repo), the meta-agent **halts and yields to the user** with instructions to pass `--state_root` outside `CODE_ROOT`. Auto-relocation is only enabled via an explicit `--auto_relocate_state` flag.
+</ParamField>
+
+<ParamField path="--auto_relocate_state" type="flag">
+  **OPT-IN.** When `state_root` is inside `CODE_ROOT` (colocated state), authorize the meta-agent to atomically move `workspace/` and `.mantis_snapshots/` to a sibling directory outside `CODE_ROOT`. The move is atomic (`rename(2)`) and is skipped if `workspace/.workspace_edit.lock` is held. Without this flag, colocated state always halts.
+</ParamField>
+
+## Input / Output Contract
+
+**Reads:**
+
+| Path | Purpose |
+|---|---|
+| `workspace/.mantis_state.json` | `pass_number`, `active_snapshot`, `snapshot_history`, `vcs_info` |
+| `workspace/findings/*.json` | Finding `patch_status` verification between stage transitions |
+| `workspace/.workspace_edit.lock` | Pre-sync safety gate: must be free before deleting stale `.bak-*` files |
+| `CODE_ROOT/.mantis_snapshot_id` | Snapshot reuse / STOP check in Block D step 0 |
+
+**Writes:**
+
+| Path | Purpose |
+|---|---|
+| `workspace/archive/findings_pass_<N>/` | Archive of all findings JSON files and `.trash/` after Stage 15 |
+| `workspace/archive/findings_pass_<N>/.mantis_state.json` | Immutable copy of pass boundary state |
+| `workspace/archive/findings_pass_<N>/kb/` | Copy of `workspace/kb/` at pass boundary |
+| `workspace/.mantis_state.json` | `pass_number`, `last_updated`, `vcs_info`; and (when `--sync`) `active_snapshot`, `snapshot_history` |
+| `<state_root>/.mantis_snapshots/pass_<N>/` | Immutable snapshot copy (only when `--sync` pins successfully) |
+
+## The Continuous Loop Lifecycle
+
+The meta-agent drives a **continuous, self-chaining loop**. Each iteration is one **pass** identified by a monotonically incrementing `pass_number`.
+
+### Pass Lifecycle — Strict Order
+
+At the start of every pass, four steps execute in **exactly this order** when `--sync` is active. They must never be reordered, and snapshot identity must never be recorded before Step 1 (SYNC) completes.
+
+<Steps>
+  <Step title="SYNC (Block C) — first action of the pass">
+    Pre-sync backup hygiene: removes stale `*.bak-<uuid>` files left by interrupted patch runs (only when the workspace edit lock is free and all findings have `patch_status` set).
+
+    Syncs the target with upstream using a non-destructive VCS command:
+    - **Git:** `git fetch && git merge --ff-only`
+    - **Mercurial:** `hg pull && hg update --check`
+    - **Multi-VCS (repo):** `repo sync`
+
+    Sync is **skipped** when the tree is dirty, ahead of upstream, detached, or has no upstream. User edits and in-progress work always survive. Commands that discard uncommitted state (`git reset --hard`, `git checkout -- .`, `git clean`, `hg update -C`) are **never run**.
+  </Step>
+  <Step title="FRESH VCS DETECT (Block C)">
+    Re-detects VCS type and captures `commit_hash`, `branch`, and `dirty` status from the post-sync tree. Records `vcs_info` in `workspace/.mantis_state.json`. This always runs — both with and without `--sync`.
+  </Step>
+  <Step title="PIN IMMUTABLE SNAPSHOT (Block D) — after sync, `--sync` only">
+    Materializes a read-only snapshot copy with tiered strategy:
+
+    1. **Crash-resume check:** If `active_snapshot.pass == N` already exists, reuse it (idempotent recovery).
+    2. **Free-space precheck:** Compare `du -s` of live tree vs. `df` free space at `state_root`. Abort to HALT if insufficient.
+    3. **Copy strategy (tiered):**
+       - Clean Git → `git worktree add --detach`
+       - Clean Mercurial → `hg archive`
+       - Copyable tree → full recursive copy excluding `.git`, `.hg`, `workspace/`, `.mantis_snapshots/`, `mantis-summary.md`, `*.bak-<uuid>`
+       - Single binary/firmware → copy the artifact
+       - Live endpoint / not a local dir → HALT mode
+    4. **SNAPSHOT_ID assembly:** `commit_hash` (clean VCS), `commit_hash:content_hash` (dirty VCS), `content:content_hash` (no VCS), `live:<ISO8601>` (HALT)
+    5. **Write sentinel:** `CODE_ROOT/.mantis_snapshot_id = SNAPSHOT_ID`; `chmod -R a-w` the copy.
+    6. **GC:** Retain last `--snapshot_keep` (default 2) snapshot directories; delete older ones with matching teardown.
+
+    **HALT mode** (`snapshot_pinned=false`): When pinning fails, the meta-agent still writes `active_snapshot` and passes `--snapshot_root`/`--snapshot_id` to all stages so they degrade conservatively — no authoritative verdicts (`VERIFIED_SECURE`, `failed_to_reproduce`, `DUPLICATE`, `FALSE_POSITIVE`, `NON_VIABLE`) are permitted this pass.
+  </Step>
+  <Step title="RECORD">
+    Writes `vcs_info` and (when `--sync`) `active_snapshot` to `workspace/.mantis_state.json`. Does **not** re-append `snapshot_history` — Block D step 5 already wrote exactly one entry for this pass. `pass_number` and `last_updated` are also written here.
+  </Step>
+</Steps>
+
+### Stage Delegation Sequence
+
+After the pass lifecycle steps complete, the meta-agent delegates sequentially to specialized subagents:
+
+| Stage | Subagent | Description |
+|---|---|---|
+| 0 | `@mantis-history` | (Optional) VCS history extraction for historical vulnerability context |
+| 0.5 | `@mantis-structural-index` | (Optional) Builds AST-level structural index for large codebases |
+| 1 | `@mantis-summarize` | (Optional) Generates `mantis-summary.md` directory maps |
+| 2 | `@mantis-architecture` | KB synthesis from codebase structure and learnings inbox |
+| 3 | `@mantis-threat-model` | Threat model evaluation and `THREAT_MODEL.md` update |
+| 4 | `@mantis-plan` | Generates `workspace/plan.json` with targeted investigation context |
+| 5 | `@mantis-researcher` | Deep code sweep; populates `workspace/findings/` |
+| 6 | `@mantis-dedupe` | Deduplicates finding files |
+| 7 | `@mantis-review` | 13-rule negative filter review of findings |
+| 8 | `@mantis-critic` | Production viability assessment |
+| 9 | `@mantis-reproduce` | Crash reproducer development and update |
+| 10 | `@mantis-chain` | Multi-step exploit chain construction |
+| 11 | `@mantis-patch` | Fix generation with iterative re-attack bypass loop |
+| 12 | `@mantis-calibrate` | Final risk scoring |
+| 13 | `@mantis-reflect` | Trajectory analysis; appends to `workspace/learnings.jsonl` |
+| 14 | `@mantis-report` | Generates `workspace/report/review_packet-latest.md` |
+| 15 | `@mantis-architecture` (again) | Final KB synthesis of this round's confirmed findings |
+
+<Note>
+When `--sync` is active, the meta-agent appends `--snapshot_root=<root> --snapshot_id=<id> --state_root=<parent>` to the instruction string of **every** stage delegation, including findings-only stages (report, calibrate, reflect). These stages ignore the code root but still read `active_snapshot` for provenance.
+</Note>
+
+### Stage 15: Archive and Pass Increment
+
+Stage 15 closes the pass boundary:
+
+1. Calls `@mantis-architecture` for final KB synthesis of this round's confirmed/resolved findings.
+2. Verifies KB updates and `workspace/learnings.jsonl` processing.
+3. **Snapshot the pass boundary** (always, even if `findings/` is empty): COPIES `workspace/.mantis_state.json` and the entire `workspace/kb/` directory into `workspace/archive/findings_pass_<N>/`.
+4. **Moves** all `workspace/findings/*.json` and `workspace/findings/.trash/` into `workspace/archive/findings_pass_<N>/`.
+5. Increments `pass_number` to `N+1` and writes the new value and `last_updated` timestamp.
+6. **Preserves** existing `vcs_info`, `active_snapshot`, and `snapshot_history` keys — this is an in-place key update, not a fresh-object overwrite.
+
+After Stage 15 completes, the meta-agent **immediately begins the next pass** without user intervention.
+
+## Supervision and Error Handling
+
+The meta-agent monitors subagent results between stages:
+
+- **State verification:** After each stage, optionally inspects a sample of `workspace/findings/*.json` to verify the expected state transitions occurred (avoids token bloat by not reading all files when there are many).
+- **Failure recovery:** If a subagent reports a critical failure, the meta-agent diagnoses the issue, explains the environment fix, and retries.
+- **Transient issues:** Rate limits and temporary file locks are retried before the meta-agent halts. Only permanent, non-recoverable errors cause the loop to stop.
+
+**Reporting thresholds:**
+- Findings with `repro_status: failed_to_reproduce` are **never reported as confirmed vulnerabilities**.
+- `LOW` priority and `NON_VIABLE` findings are listed separately in a "Hygiene & Low Priority Notes" section, never as active security flaws.
+
+## Human-in-the-Loop Steering
+
+While the meta-agent is designed for autonomy, it remains responsive to user input at any time:
+
+- **Progress updates:** The user can interrupt the loop to ask for status.
+- **Strategic guidance:** High-level direction (e.g., "Focus exclusively on the networking stack next pass") is incorporated into subsequent subagent instructions.
+- **Target changes and sync requests:** Applied **only at a pass boundary**, and only when `workspace/findings/` is empty (all findings archived). Mid-pass changes are deferred. If the user insists on aborting, Stage 15 runs first to archive current findings.
+
+## Cloud Pub/Sub Alerting Integration
+
+The meta-agent can be integrated with a Cloud Pub/Sub topic to emit campaign events — confirmed reproductions, verified patches, calibration completions — as structured messages. This allows external monitoring systems, dashboards, and CI/CD pipelines to react to campaign milestones without polling the workspace directly.
+
+When a finding is confirmed reproduced or a patch is verified (reported by `@mantis-patch`), or when `@mantis-calibrate` finishes scoring, the meta-agent may publish a brief structured summary to the configured Pub/Sub topic. The message payload mirrors the finding's key fields: `id`, `title`, `priority`, `mantis_risk_score`, `repro_status`, and `patch_status`.
+
+## Target Agnosticism
+
+The meta-agent and its subagents are not limited to source code:
+
+> The target may be raw source code, a compiled binary, a firmware blob, or a live staging/dev endpoint. Ground analysis in whatever format the target is currently in. Suitable tools (`unblob`, `radare2`, `angr`, `objdump`, `Ghidra`, `qemu`, `unicorn`, emulator harnesses) are available. If source code is not available, do not force a source-code workflow — adapt and do what works for the artifact at hand.
+
+## Workspace State at a Glance
+
+```text
+workspace/
+├── .mantis_state.json           ← pass_number, vcs_info, active_snapshot, snapshot_history
+├── findings/                    ← active findings for current pass
+│   └── <uuid>.json
+├── kb/                          ← permanent Knowledge Base
+│   ├── THREAT_MODEL.md
+│   └── ...
+├── report/
+│   ├── review_packet-latest.md  ← always-current campaign report
+│   └── review_packet_pass_<N>_<snapshot_tag>.md
+├── archive/
+│   ├── findings_pass_<N>/       ← archived findings + kb snapshot per pass
+│   └── .repro_attempts.json
+└── learnings.jsonl              ← pending insights inbox (rotated after synthesis)
+
+.mantis_snapshots/               ← pinned immutable snapshot copies (outside workspace)
+└── pass_<N>/
+    └── .mantis_snapshot_id
+```
+
+## Notes
+
+<Note>
+**MODE-OFF is the default.** Without `--sync`, the meta-agent runs against the live tree exactly as today. No `active_snapshot` or `snapshot_history` is written, and all downstream stages operate in the backward-compatible single-snapshot mode.
+</Note>
+
+<Warning>
+**Colocated state must be resolved before pinning.** If `state_root` is inside `CODE_ROOT` (the default when launching from inside the target repo), the meta-agent halts and asks the user to either pass `--state_root` pointing outside the repo, or pass `--auto_relocate_state` to authorize an atomic move. Never proceed with pinning when state is colocated — it breaks `mantis-patch`'s state-vs-code path guard.
+</Warning>
+
+<Warning>
+**`active_snapshot` must be deleted when entering MODE-OFF.** Because Stage 15 preserves `active_snapshot` across pass boundaries, a prior `--sync` pass leaves a stale `active_snapshot` (with `pass == N-1`) in state. When running a pass without `--sync`, the meta-agent **actively deletes** the `active_snapshot` key from `workspace/.mantis_state.json` (in-place key delete, not a fresh-object overwrite). Leaving the stale key would trip the cross-pass staleness gate in consumer stages.
+</Warning>
+
+<Tip>
+Raise `--snapshot_keep` beyond the default of 2 when you want to rebase patches or PoC scripts against a finding's original discovery snapshot from several passes ago. The default of 2 is safe for correctness — correctness never re-reads an older snapshot — but forensic or re-patching workflows may need more history.
+</Tip>

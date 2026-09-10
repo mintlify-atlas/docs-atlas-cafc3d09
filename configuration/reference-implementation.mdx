@@ -1,0 +1,255 @@
+---
+title: "Set Up the ADK Reference Implementation"
+sidebarTitle: "Reference Impl"
+description: "Install and configure the production-grade ADK harness in reference/: layered config, auto-detection, launch flags, and preflight validation."
+---
+
+The `reference/` directory contains a production-grade implementation of the Mantis architecture built on the Google Agent Development Kit (ADK). It is the authoritative demonstration of how to wire Mantis skills into a real pipeline: a declarative workflow graph, pluggable sandbox environments, layered configuration, a 3-tier deduplication system, and hermetic dependency management. You can use it directly, or use it as the reference point when building your own harness.
+
+## What's in reference/
+
+```
+reference/
+├── workflow.json          # Tracked template — 16-node pipeline graph
+├── workflow.local.json    # Gitignored local overrides (auto-generated)
+├── run.sh                 # Convenience launcher wrapper
+├── install.sh             # Installs dependencies with --require-hashes
+├── requirements.txt       # Pinned + hashed Python dependencies
+├── requirements.in        # Human-editable dependency source
+├── knowledge.db           # SQLite findings store (created on first run)
+├── scripts/
+│   ├── configure.py       # /mantis-configure — wizard, auto-detect, preflight
+│   ├── launch.py          # /mantis-launch — autonomous runner with auto-healing
+│   ├── advise.py          # /mantis-advise — security advisor queries
+│   └── setup_gce_sandbox.sh  # Idempotent GCE VPC + image setup
+└── core/
+    ├── config.py          # Model routing and LLM kwargs resolution
+    ├── graph_loader.py    # Compiles workflow.json into ADK constructs
+    ├── database.py        # OKF v0.2 SQLite knowledge store
+    ├── embeddings.py      # 3-tier deduplication with semantic vectors
+    └── environments/      # Pluggable sandbox implementations
+```
+
+## Installing Dependencies
+
+The reference implementation uses supply-chain-secure dependency management. All dependencies are pinned with exact version hashes in `requirements.txt`, compiled from `requirements.in` using `pip-tools`. The `install.sh` script enforces hash verification during installation.
+
+```bash
+# Install all dependencies (enforces --require-hashes for supply chain integrity)
+./reference/install.sh
+```
+
+<Note>
+  `install.sh` uses `pip install --require-hashes`, which means every package must have a matching hash in `requirements.txt`. If you add a dependency, regenerate `requirements.txt` from `requirements.in` using `pip-compile --generate-hashes reference/requirements.in`.
+</Note>
+
+## Layered Configuration
+
+The reference implementation uses two configuration files that are merged at runtime:
+
+<CardGroup cols={2}>
+  <Card title="workflow.json (Tracked)" icon="code-branch">
+    The canonical template committed to version control. Contains placeholder values (`YOUR_PROJECT_ID`) for fields that vary by environment. Never put real credentials or project IDs here — this file is shared across the team.
+  </Card>
+  <Card title="workflow.local.json (Gitignored)" icon="user-lock">
+    Automatically generated local overlay. Contains your resolved GCP project, active sandbox selection, model overrides, and API keys. This file is gitignored and takes precedence over `workflow.json` for any field it defines.
+  </Card>
+</CardGroup>
+
+The `workflow.local.json` overlay is created and updated by `configure.py`. You should never need to edit it manually.
+
+```bash
+# View current effective configuration (merged view)
+python3 reference/scripts/configure.py --show
+```
+
+## Auto-Configuration
+
+The `--auto` flag inspects the host environment and configures the best available sandbox and credentials automatically:
+
+```bash
+python3 reference/scripts/configure.py --auto
+```
+
+This command:
+1. Detects available container runtimes (`docker`/`podman` with `runsc`, `/dev/kvm`)
+2. Detects active GCP credentials and project (`gcloud config get-value project`)
+3. Selects the highest-isolation sandbox available (GCE > microsandbox > gVisor > static-only)
+4. Writes the resolved configuration to `workflow.local.json`
+5. Runs a fast preflight check to confirm the selected configuration works
+
+## Preflight Validation
+
+Run the preflight check at any time to verify that LLM credentials are valid and the selected sandbox is operational. The check completes in about one second.
+
+```bash
+python3 reference/scripts/configure.py --test
+```
+
+The preflight check validates:
+- LLM endpoint reachability and credential validity
+- Sandbox prerequisites (container runtime for gVisor, KVM access for microsandbox, `gcloud` auth for GCE)
+- `workflow.json` for unconfigured placeholder values
+
+A preflight failure produces a clear error message explaining what is missing and how to fix it, without starting a full scan campaign.
+
+## Launching a Campaign
+
+Once configured, launch a vulnerability review campaign with `run.sh` or `launch.py`:
+
+```bash
+# Scan a specific file
+./reference/run.sh src/server/auth.py
+
+# Scan an entire repository
+./reference/run.sh .
+
+# Specify a path from the repo root
+./reference/run.sh /path/to/your/repo
+```
+
+Both `run.sh` and `launch.py` perform automatic auto-healing before starting: they inspect `workflow.json` for unconfigured placeholders, attempt to auto-resolve them from the host environment, run the preflight check, and only then start the campaign.
+
+## Launch Flags Reference
+
+<ParamField path="target" type="string" required>
+  Path to a single source file or a root repository directory to scan. Examples: `src/auth.py`, `.`, `/path/to/repo`.
+</ParamField>
+
+<ParamField path="--sandbox / -s" type="string">
+  Override the sandbox mechanism for this run without modifying `workflow.json`. Values: `static-only`, `gvisor`, `microsandbox`, `gce`.
+  ```bash
+  ./reference/run.sh . --sandbox gvisor
+  ```
+</ParamField>
+
+<ParamField path="--model / -m" type="string">
+  Override the AI model for this run. Accepts any model ID recognized by `normalize_model_id()`.
+  ```bash
+  ./reference/run.sh . --model vertex_ai/claude-opus-5
+  ```
+</ParamField>
+
+<ParamField path="--api-base" type="string">
+  Custom base URL for OpenAI-compatible LLM endpoints (vLLM, Ollama, LiteLLM proxy).
+  ```bash
+  ./reference/run.sh . --model openai/my-model --api-base http://localhost:8000/v1
+  ```
+</ParamField>
+
+<ParamField path="--reasoning-effort" type="string">
+  Override the reasoning effort level for all nodes: `low`, `medium`, or `high`.
+</ParamField>
+
+<ParamField path="--timeout" type="number">
+  LLM request timeout in seconds for this run.
+</ParamField>
+
+<ParamField path="--preflight-only / --test" type="boolean">
+  Run preflight checks and exit without starting the campaign. Equivalent to `configure.py --test`.
+  ```bash
+  python3 reference/scripts/launch.py . --preflight-only
+  ```
+</ParamField>
+
+<ParamField path="--dry-run" type="boolean">
+  Display the launch plan and the list of indexed files without calling any AI models. Useful for verifying that the target path is correctly resolved before committing to a full scan.
+</ParamField>
+
+<ParamField path="--no-auto-configure" type="boolean">
+  Disable automatic placeholder detection and auto-healing. Use this when you want to control the configuration entirely manually and do not want `launch.py` to modify `workflow.local.json`.
+</ParamField>
+
+<ParamField path="--interactive" type="boolean">
+  Launch the interactive configuration wizard before starting execution.
+</ParamField>
+
+## Common Launch Workflows
+
+<Tabs>
+  <Tab title="Static Analysis Only">
+    ```bash
+    # No sandbox dependencies required
+    ./reference/run.sh . --sandbox static-only
+    ```
+  </Tab>
+  <Tab title="gVisor Sandbox">
+    ```bash
+    # Requires Docker + runsc registered
+    ./reference/run.sh . --sandbox gvisor
+    ```
+  </Tab>
+  <Tab title="Specific Model">
+    ```bash
+    # Use Claude for all stages
+    ./reference/run.sh . --model vertex_ai/claude-opus-5
+
+    # Use a local LLM server
+    ./reference/run.sh . \
+      --model openai/my-model \
+      --api-base http://localhost:8000/v1
+    ```
+  </Tab>
+  <Tab title="Verify Preflight">
+    ```bash
+    # Check everything without scanning
+    python3 reference/scripts/launch.py . --preflight-only
+
+    # Or use configure.py directly
+    python3 reference/scripts/configure.py --test
+    ```
+  </Tab>
+</Tabs>
+
+## Querying Results
+
+After a campaign completes, all findings, exploit reproduction logs, verified patches, and risk calibration scores are stored in `knowledge.db`. Query the stored knowledge using the `mantis-advise` script:
+
+```bash
+# Get security guidance for a specific file
+python3 reference/scripts/advise.py --file src/server/auth.py
+
+# Export findings in OKF v0.2 bundle format
+python3 reference/scripts/advise.py --export-okf ./okf-export/
+
+# Import an OKF bundle from another campaign
+python3 reference/scripts/advise.py --import-okf ./okf-import/
+```
+
+## The Workflow Graph
+
+The `workflow.json` file defines the full 16-node pipeline graph declaratively. Each node specifies a skill directory, model, reasoning effort, tools, and optional output schema. The `edges` array defines the control flow, including conditional branches through classifier nodes.
+
+```json
+{
+  "name": "mantis_vulnerability_pipeline",
+  "config": {
+    "db_path": "knowledge.db",
+    "retry_attempts": 3,
+    "default_model": "vertex_ai/gemini-3.7-flash",
+    "reasoning_effort": "medium",
+    "sandbox": {
+      "type": "gce",
+      "options": {
+        "project": "YOUR_PROJECT_ID",
+        "zone": "us-central1-b",
+        "image": "mantis-sandbox-image",
+        "subnet": "mantis-isolated-subnet",
+        "tunnel_through_iap": true,
+        "no_service_account": true,
+        "no_external_ip": true,
+        "verify_isolation": true,
+        "timeout_seconds": 600
+      }
+    }
+  },
+  "nodes": [ ... ],
+  "edges": [ ... ]
+}
+```
+
+`core/graph_loader.py` compiles this JSON into native ADK `Workflow`, `Agent`, and `Classifier` constructs at runtime, attaching Mantis skill directories as `SkillToolset` instances and providing fallback system prompts from `prompts/system-*.md`.
+
+<Info>
+  The `workflow.json` shipped in the repository uses `gce` as the default sandbox type with `YOUR_PROJECT_ID` as a placeholder. Run `python3 reference/scripts/configure.py --auto` to auto-detect your environment and write the correct values to `workflow.local.json`.
+</Info>

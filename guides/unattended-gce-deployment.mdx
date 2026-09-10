@@ -1,0 +1,239 @@
+---
+title: "Deploy Mantis Unattended on Google Compute Engine"
+sidebarTitle: "GCE Deployment"
+description: "Harden a GCE VM for 24/7 unattended Mantis operation: network isolation, VPC-SC, least-privilege IAM, append-only GCS, and Pub/Sub alerting."
+---
+
+Running the Mantis review loop continuously in a fully autonomous, unattended state introduces unique security risks — chief among them **host-level prompt injection**, where a malicious payload embedded in a target file tricks the agent into executing harmful commands on the host. Deploying inside a hardened Google Compute Engine (GCE) VM is a strict requirement for unattended mode. This guide walks through every layer of the required hardening.
+
+<Warning>
+  **Deploying to a hardened VM is a STRICT REQUIREMENT for unattended mode.** Never run the continuous loop with `--dangerously-skip-permissions` or `--yolo` on a machine that has access to production systems, sensitive data, or internal networks. The instructions below are the minimum required baseline.
+</Warning>
+
+## Overview of Hardening Layers
+
+The unattended deployment hardening works in concentric rings, each blocking a different escape vector:
+
+1. **Network isolation** — no external internet path exists, so exfiltrated data has nowhere to go
+2. **VPC Service Controls** — data plane boundary prevents lateral movement to other GCP services
+3. **Least-privilege IAM** — even if the agent is compromised, it cannot modify AI infrastructure or delete findings
+4. **Append-only GCS storage** — all intermediate results are preserved even if the AI overwrites files
+5. **DNS blackholing** — closes the out-of-band link-local DNS exfiltration path
+6. **Active isolation audit** — the sandbox verifies its own containment before executing any generated code
+
+An automated idempotent setup script is available at `reference/scripts/setup_gce_sandbox.sh`:
+
+```bash
+PROJECT_ID="your-project-id" SOURCE_INSTANCE="your-dev-vm" \
+    ./reference/scripts/setup_gce_sandbox.sh
+```
+
+## Step 1: Network Isolation
+
+Provision the GCE VM with no external internet access and no NAT gateway. The VM should only be reachable via IAP SSH tunnel from the Google Cloud IAP IP range.
+
+```bash
+export PROJECT_ID="$(gcloud config get-value project)"
+export REGION="us-central1"
+export ZONE="us-central1-a"
+export VPC_NAME="mantis-isolated-vpc"
+export SUBNET_NAME="mantis-isolated-subnet"
+export SUBNET_RANGE="10.0.0.0/24"
+
+# 1. Create a custom VPC (no auto-subnets)
+gcloud compute networks create "${VPC_NAME}" \
+    --project="${PROJECT_ID}" \
+    --subnet-mode=custom
+
+# 2. Private subnet — no internet route, no Cloud NAT, no Private Google Access
+gcloud compute networks subnets create "${SUBNET_NAME}" \
+    --project="${PROJECT_ID}" \
+    --network="${VPC_NAME}" \
+    --region="${REGION}" \
+    --range="${SUBNET_RANGE}" \
+    --no-enable-private-ip-google-access
+
+# 3. Allow SSH only from Google IAP IP range (35.235.240.0/20)
+gcloud compute firewall-rules create "allow-iap-ssh-${VPC_NAME}" \
+    --project="${PROJECT_ID}" \
+    --network="${VPC_NAME}" \
+    --allow=tcp:22 \
+    --source-ranges=35.235.240.0/20
+```
+
+<Note>
+  `--no-enable-private-ip-google-access` ensures the sandbox VM cannot reach Google APIs (including the metadata server's token endpoint) via the subnet's default path. The `GceEnvironment` active isolation probe verifies this at VM startup.
+</Note>
+
+## Step 2: DNS Exfiltration Defense
+
+By default in GCE, queries to the link-local metadata resolver (`169.254.169.254:53`) perform recursive public DNS lookups out-of-band via the hypervisor — an exfiltration path that exists even without external IP routing. Seal this at the VPC level.
+
+<Tabs>
+  <Tab title="Option A: Response Policy (RPZ Wildcard)">
+    ```bash
+    export DNS_POLICY_NAME="mantis-block-public-dns"
+
+    # Create a response policy bound to the isolated VPC
+    gcloud dns response-policies create "${DNS_POLICY_NAME}" \
+        --project="${PROJECT_ID}" \
+        --networks="${VPC_NAME}" \
+        --description="Block all public DNS lookups from Mantis sandbox VMs"
+
+    # Wildcard rule returning 0.0.0.0 for all domains
+    gcloud dns response-policies rules create block-all-domains \
+        --project="${PROJECT_ID}" \
+        --response-policy="${DNS_POLICY_NAME}" \
+        --dns-name="*." \
+        --local-data=name="*.",type="A",ttl=300,rrdatas="0.0.0.0"
+    ```
+  </Tab>
+  <Tab title="Option B: Outbound DNS Sinkhole">
+    ```bash
+    # Redirect all VM DNS queries to a private sinkhole IP (unassigned)
+    gcloud dns policies create mantis-dns-blackhole \
+        --project="${PROJECT_ID}" \
+        --networks="${VPC_NAME}" \
+        --description="Redirect VM DNS to private blackhole" \
+        --private-alternative-name-servers=10.0.0.254 \
+        --enable-logging
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  The wildcard response policy (`*.` → `0.0.0.0`) catches all DNS lookups including internal `*.internal` names. For single-VM setups this is correct. If you extend to multi-VM campaigns, you must add explicit bypass rules for internal peer records.
+</Warning>
+
+## Step 3: VPC Service Controls
+
+Place the VM inside a VPC Service Controls (VPC-SC) perimeter to defend against data exfiltration even if an agent is compromised:
+
+```bash
+# Create a VPC-SC access policy (if one doesn't already exist for your org)
+gcloud access-context-manager policies create \
+    --organization=YOUR_ORG_ID \
+    --title="Mantis Unattended Access Policy"
+
+# Create a service perimeter restricting GCS, BigQuery, and AI Platform APIs
+gcloud access-context-manager perimeters create mantis-perimeter \
+    --policy=YOUR_POLICY_ID \
+    --title="Mantis Sandbox Perimeter" \
+    --resources="projects/${PROJECT_ID}" \
+    --restricted-services="storage.googleapis.com,bigquery.googleapis.com,aiplatform.googleapis.com"
+```
+
+## Step 4: Least-Privilege IAM Service Account
+
+Create a dedicated service account for the GCE VM running the Mantis pipeline. Do not use broad roles like `roles/aiplatform.user` or `roles/storage.objectAdmin`.
+
+```bash
+# Create the dedicated service account
+gcloud iam service-accounts create mantis-runner \
+    --project="${PROJECT_ID}" \
+    --display-name="Mantis Unattended Runner"
+
+# Create a custom AI role — only query models, cannot modify AI infrastructure
+gcloud iam roles create MantisAIInference \
+    --project="${PROJECT_ID}" \
+    --title="Mantis AI Inference Only" \
+    --description="Allows querying Vertex AI models only" \
+    --permissions="aiplatform.endpoints.predict,aiplatform.endpoints.generateContent"
+
+# Bind the custom AI role
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:mantis-runner@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="projects/${PROJECT_ID}/roles/MantisAIInference"
+```
+
+## Step 5: Append-Only GCS Storage
+
+Grant the service account append-only access to a GCS bucket for storing intermediate results. Do **not** grant delete permissions.
+
+```bash
+# Create the findings bucket
+gsutil mb -p "${PROJECT_ID}" gs://mantis-findings-${PROJECT_ID}
+
+# Enable object versioning — preserves history even if AI overwrites files
+gsutil versioning set on gs://mantis-findings-${PROJECT_ID}
+
+# Grant objectCreator and objectViewer only — no delete
+gcloud storage buckets add-iam-policy-binding \
+    gs://mantis-findings-${PROJECT_ID} \
+    --member="serviceAccount:mantis-runner@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/storage.objectCreator"
+
+gcloud storage buckets add-iam-policy-binding \
+    gs://mantis-findings-${PROJECT_ID} \
+    --member="serviceAccount:mantis-runner@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/storage.objectViewer"
+```
+
+<Info>
+  Object Versioning means that even if the AI or an untrusted crash reproducer payload overwrites `workspace/learnings.jsonl`, previous states are preserved as non-current versions. This prevents the AI from permanently deleting its own history.
+</Info>
+
+## Step 6: Enabling Unattended Mode
+
+Once the hardened environment is fully configured and verified, you can enable unattended mode by passing the appropriate auto-approve flag when starting the CLI:
+
+<Tabs>
+  <Tab title="Gemini CLI">
+    ```bash
+    gemini --dangerously-skip-permissions
+    # Then: /mantis-meta-agent --sync
+    ```
+  </Tab>
+  <Tab title="Other CLIs">
+    ```bash
+    # Pass --yolo or the equivalent auto-approve flag for your CLI
+    your-cli --yolo
+    # Then: /mantis-meta-agent --sync
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  Only use `--dangerously-skip-permissions` / `--yolo` after completing **all** of the hardening steps above. The flag suppresses every interactive confirmation prompt. Without the network isolation, VPC-SC perimeter, and restricted IAM, an AI agent executing these flags on a regular machine is extremely dangerous.
+</Warning>
+
+## Step 7: Pub/Sub Alerting
+
+Set up automated notifications for high-confidence discoveries. This lets you monitor the unattended campaign without polling the findings directory.
+
+```bash
+# Create the Pub/Sub topic
+gcloud pubsub topics create mantis-verified-vulns \
+    --project="${PROJECT_ID}"
+
+# Grant publisher role to the runner service account
+gcloud pubsub topics add-iam-policy-binding mantis-verified-vulns \
+    --project="${PROJECT_ID}" \
+    --member="serviceAccount:mantis-runner@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/pubsub.publisher"
+
+# Create a Cloud Function or Cloud Run subscriber to route alerts
+# to your team's chat, issue tracker, or paging system
+```
+
+Instruct the Meta-Agent to publish whenever a finding is successfully reproduced:
+
+```bash
+gcloud pubsub topics publish mantis-verified-vulns \
+    --message="$(cat workspace/findings/<id>.json)"
+```
+
+Subscribe a Cloud Function or Cloud Run service to the topic to route alerts into your internal tooling. This decouples the isolated scanning environment from your alerting infrastructure.
+
+## Active Isolation Audit
+
+The `GceEnvironment` automatically verifies its own containment before executing any generated code when `verify_isolation: true` is set in `workflow.json` (the default). The probe checks:
+
+- **IAM token leak**: Queries the metadata server for service account tokens — fails if accessible
+- **Direct internet egress**: Attempts TCP connection to `1.1.1.1:80` — fails if reachable
+- **Public DNS recursion**: Attempts resolving `example.com` — fails if a public IP is returned
+- **Private Google Access**: Attempts TCP to `storage.googleapis.com:443` — fails if reachable
+- **IPv6 egress**: Attempts connection to public IPv6 resolvers — fails if reachable
+- **UDP/53 egress**: Sends a DNS query to `8.8.8.8` — fails if a response is received
+
+If any check fails, the VM is immediately deleted and Mantis halts with a `RuntimeError` detailing the misconfiguration. This fail-closed behavior means a misconfigured environment produces an explicit error rather than silently leaking data.

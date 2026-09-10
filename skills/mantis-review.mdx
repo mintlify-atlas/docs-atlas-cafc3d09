@@ -1,0 +1,252 @@
+---
+title: "/mantis-review: False Positive Filter and Validator"
+sidebarTitle: "/mantis-review"
+description: "Independently validate deduplicated findings against source code, filter false positives using 13 strict negative constraints, and produce triage checklists for downstream stages."
+---
+
+After deduplication, every finding is still unverified — it may be a
+hallucination, a mis-attributed line number, or a genuine but non-exploitable
+code smell. `/mantis-review` resolves that uncertainty by reading the actual
+source code at each finding's `code_paths` location and evaluating the claim
+against 13 strict negative constraints. It adopts an **adversarial stance by
+default**: every finding is presumed a false positive until the code
+independently proves otherwise. The reviewer deliberately ignores the original
+finder's prose reasoning, since that reasoning may itself be hallucinated. Use
+it on consolidated findings after `/mantis-dedupe` and before
+`/mantis-critic`. Do not use it for writing reproducers or patching code.
+
+## Command
+
+```
+/mantis-review [--snapshot_root=<path>] [--snapshot_id=<id>] [--state_root=<path>] [--target_root=<path>]
+```
+
+<ParamField path="--target_root" type="string" optional>
+  AUTHORITATIVE path to the target codebase root. Overrides all other locator
+  sources and is sentinel-exempt. Use when a caller hands you a pre-prepared
+  tree such as a patched shadow.
+</ParamField>
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Path to the pinned, immutable snapshot copy for this pass (used as `CODE_ROOT`
+  when `--target_root` is absent).
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The `SNAPSHOT_ID` for this pass. Used for the sentinel check and per-finding
+  snapshot match (Block B drift gate).
+</ParamField>
+
+<ParamField path="--state_root" type="string" default=".">
+  Parent directory of `workspace/`. All state paths resolve relative to this root.
+</ParamField>
+
+## Input / Output Contract
+
+<Tabs>
+  <Tab title="Reads">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/*.json` | Deduplicated findings to validate (including `discovery_commit` stamps) |
+    | `workspace/.mantis_state.json` | Current `pass_number` and `active_snapshot` (root, `snapshot_id`, `snapshot_pinned`) |
+    | Target source files under `CODE_ROOT` | Actual source code at each finding's `code_paths` locations |
+  </Tab>
+  <Tab title="Writes">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/<id>.json` | Updated in-place: `status`, `reasoning`, `repro_hints`, `triage_checklist`, and a `reviewer` history entry |
+    | `workspace/helpers/append_review.py` | Versioned helper script (`MANTIS_HELPER_VERSION = 2`) used for token-efficient in-place updates |
+  </Tab>
+</Tabs>
+
+## Usage
+
+```
+/mantis-review
+```
+
+Invoke without arguments for MODE-OFF (live tree, no snapshot pinning). The
+skill reads `workspace/findings/`, verifies each finding against source code,
+and writes verdict fields back in place.
+
+**With a pinned snapshot:**
+
+```
+/mantis-review \
+  --snapshot_root=/tmp/mantis_snapshots/pass_3 \
+  --snapshot_id=abc123def456 \
+  --state_root=/workspace
+```
+
+## Status Values
+
+Each finding receives one of four statuses after review:
+
+<CardGroup cols={2}>
+  <Card title="VALID" icon="check-circle">
+    Passes all 13 constraints. A clear, directly triggerable flaw exists in the
+    code as written. Every `triage_checklist` entry must be `PASS` or
+    `NOT_APPLICABLE` — no `UNKNOWN` or `FAIL`.
+  </Card>
+  <Card title="FALSE_POSITIVE" icon="x-circle">
+    Violates at least one constraint. The only status for which a
+    `triage_checklist` entry may be `"FAIL"`. A `FAIL` entry always requires
+    a `reason` field.
+  </Card>
+  <Card title="PROVISIONALLY_VALID" icon="circle-question">
+    Passes the rules but feasibility requires dynamic verification (e.g.,
+    complex heap grooming or precise timing). Promoted to `VALID` after a
+    successful reproduction — unless `triage_checklist` still contains
+    `UNKNOWN` entries, in which case upgrade is blocked.
+  </Card>
+  <Card title="NEEDS_RESEARCH" icon="magnifying-glass">
+    Inconclusive due to high complexity, unresolved external APIs, or snapshot
+    drift. Never reclassified as `FALSE_POSITIVE` by the reviewer.
+  </Card>
+</CardGroup>
+
+## The 13 Triage Checklist Constraints
+
+Every finding that reaches the 13-rule evaluation step receives a
+`triage_checklist` object with an entry for each constraint below. Each entry
+has an `outcome` of `PASS`, `FAIL`, `UNKNOWN`, or `NOT_APPLICABLE`.
+
+<Warning>
+  `FAIL` is only permitted when `status` is `FALSE_POSITIVE`. For `VALID`,
+  `PROVISIONALLY_VALID`, or `NEEDS_RESEARCH` findings, every entry must be
+  `PASS`, `NOT_APPLICABLE`, or `UNKNOWN` — never `FAIL`.
+</Warning>
+
+<Accordion title="1. ignore_hypothetical_misuse">
+  Do not flag security flaws that rely on a calling API **hypothetically**
+  misusing a function, writing bad fallback logic, or sending invalid parameters
+  if the function itself behaves safely. Mark as `FALSE_POSITIVE` if the flaw
+  only exists in a theoretical bad caller, not in the code itself.
+</Accordion>
+
+<Accordion title="2. ignore_missing_hygiene">
+  Do not report missing HTTP security headers (e.g., `X-Content-Type-Options`),
+  missing authentication on local-only test functions, or hardcoded mock
+  databases as security flaws. Defense-in-depth omissions are not vulnerabilities.
+</Accordion>
+
+<Accordion title="3. require_strict_reproducibility">
+  Only mark a finding `VALID` if a direct, unambiguous, triggerable flaw exists
+  within the code logic. Extremely fragile conditions (unstable timing that
+  cannot be automated, unrealistic environmental prerequisites) warrant
+  `FALSE_POSITIVE`. **Exception:** race conditions with low individual probability
+  are still valid if the attack path can be automated and repeatedly attempted.
+</Accordion>
+
+<Accordion title="4. avoid_pedantic_linting">
+  If the code uses standard safe libraries — `json.loads`, parameterized SQL
+  queries, secure standard-library hashes — but lacks extreme paranoia, mark as
+  `FALSE_POSITIVE`. Pedantic code-style concerns are not security findings.
+</Accordion>
+
+<Accordion title="5. no_security_flaw_stretching">
+  When reviewing a mitigation or safe variant that successfully blocks the
+  original flaw class, do **not** invent complex protocol-level bypasses or
+  adjacent flaw classes (e.g., SSRF when reviewing a Command Injection fix). If
+  the primary flaw is blocked, mark as `FALSE_POSITIVE`.
+</Accordion>
+
+<Accordion title="6. evaluate_questionable_file_paths">
+  Do **not** dismiss a finding simply because its path contains `/test`,
+  `/experimental`, or `/mock`. Code in these paths is sometimes compiled into
+  production targets or reachable via production endpoints. Trace actual usage
+  before deciding.
+</Accordion>
+
+<Accordion title="7. ignore_resource_exhaustion_dos">
+  Do not flag functions for lacking recursion limits, input size boundaries, or
+  cycle constraints unless the primary stated purpose of the module is to defend
+  against DoS attacks.
+</Accordion>
+
+<Accordion title="8. intrinsic_security_flaws">
+  If a function uses a fundamentally broken algorithm (MD5, SHA1), hardcodes
+  static secrets, or contains direct injection paths in its own logic, mark
+  as `VALID` even if the function is not currently called anywhere in the
+  codebase. The flaw is intrinsic to the code, not to its callers.
+</Accordion>
+
+<Accordion title="9. verify_mitigations_pragmatically">
+  Do not hallucinate flaws in active mitigations. If the code adds trailing
+  validation slashes or configures safe parsing flags, accept that the
+  mitigation works without inventing edge cases.
+</Accordion>
+
+<Accordion title="10. refine_code_paths_strictly">
+  `code_paths` must contain only the exact `filename:line_number` of the
+  flawed code block. Strip helper files, test harnesses, and correct caller
+  files. A finding with bloated `code_paths` must have them pruned as part of
+  this review.
+</Accordion>
+
+<Accordion title="11. ignore_simd_vector_padding">
+  For out-of-bounds reads or writes inside optimized vector routines (NEON,
+  SSE, AVX, VSX), check whether the library uses a global memory allocation
+  contract with trailing safety padding (e.g., `row_bytes + 16`). If the
+  out-of-bounds access is mathematically guaranteed to stay within pre-allocated
+  padding under all execution paths, mark as `FALSE_POSITIVE (By Design)`.
+</Accordion>
+
+<Accordion title="12. ensure_source_code_coherence">
+  Verify that every file path in `code_paths` exists in the repository and that
+  function names, variable names, and line numbers actually appear at those
+  locations. If any reference is missing or incorrect, immediately mark as
+  `FALSE_POSITIVE` — this is the primary anti-hallucination gate.
+</Accordion>
+
+<Accordion title="13. verify_attacker_control_of_source">
+  Before marking a data-flow finding `VALID`, identify the `file:line` where
+  untrusted data enters the codebase (the Ingress Point) and trace it to the
+  sink. If the source data is proven to originate solely from trusted-side
+  origins (server-authored static config, host-plane internal state), mark as
+  `FALSE_POSITIVE`. **Exception:** Rule 8 (intrinsic flaws) is exempt from this
+  trust-boundary check.
+</Accordion>
+
+## Snapshot Drift Handling
+
+When snapshot mode is active (`active_snapshot` present in state), each finding
+goes through a **Snapshot Provenance Gate** before the 13 rules run:
+
+- **MATCHED** (`discovery_commit` equals the current `SNAPSHOT_ID`) → proceed
+  to full 13-rule evaluation.
+- **NOT_MATCHED** (drift: `discovery_commit` missing, empty, `"MIXED"`, or
+  differs from `SNAPSHOT_ID`) → the finding is finalized as
+  `"status": "NEEDS_RESEARCH"` with all 13 checklist entries set to `UNKNOWN`.
+  The 13 rules do **not** run. The finding is **never** marked `FALSE_POSITIVE`
+  due to drift.
+
+<Note>
+  Rules 12 and 13 (`ensure_source_code_coherence`,
+  `verify_attacker_control_of_source`) are deliberately set to `UNKNOWN` (never
+  `FAIL`) for drift findings. A line or path mismatch caused by snapshot drift
+  is not evidence of hallucination.
+</Note>
+
+## Reproduction Hints
+
+For every finding marked `VALID` or `PROVISIONALLY_VALID`, the reviewer writes
+`repro_hints` — high-signal instructions for the reproducer agent explaining:
+
+- How to trigger the bug (input paths, payload parameters)
+- What crash condition, sanitizer trace (ASan/UBSan/MSan/TSan), or functional
+  validation result (e.g., unexpected HTTP 200 OK) confirms the flaw
+
+These hints are consumed by `/mantis-reproduce` in the next pipeline stage.
+
+## Idempotency
+
+The skill checks the finding's `history` array before writing to avoid
+double-processing the same finding in the same pass. The idempotency key is
+**(pass_number, snapshot)**:
+
+- **MODE-OFF:** skip if a `"stage": "reviewer"` entry already exists for the
+  current `pass_number`.
+- **SNAPSHOT MODE ON:** skip only if a reviewer entry exists with matching
+  `pass_number` **and** `snapshot` equal to `SNAPSHOT_ID`. A legacy entry
+  without a `snapshot` field triggers a re-review against the current snapshot.

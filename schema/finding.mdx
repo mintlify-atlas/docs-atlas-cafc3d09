@@ -1,0 +1,385 @@
+---
+title: "Finding Object Schema — Mantis Pipeline Contract"
+sidebarTitle: "Finding"
+description: "Reference for the Finding object — the core state unit written to workspace/findings/<uuid>.json and progressively enriched by each Mantis pipeline skill."
+---
+
+The Finding object is the central data unit of the Mantis pipeline. Every discovered vulnerability is represented as a single JSON file at `workspace/findings/<uuid>.json`, where the filename matches the object's `id` field exactly. The object is created by `/mantis-researcher` and then progressively enriched by downstream skills — `/mantis-review` sets validity status, `/mantis-critic` adds production viability, `/mantis-reproduce` appends reproduction evidence, `/mantis-patch` records the fix, and `/mantis-calibrate` computes the final risk score. No stage may overwrite fields written by an earlier stage; the `history` array provides a full chronological audit trail of every mutation.
+
+<Note>
+  All fields are optional unless listed in the **Required fields** section below. The schema intentionally omits `additionalProperties: false`, so future fields can be appended without breaking existing workspaces. Consumers must treat any absent field as the safe/conservative default described in each field's note.
+</Note>
+
+## Required Fields
+
+These twelve fields must be present on every finding object at creation time.
+
+<ParamField body="id" type="string (uuid)" required>
+  A UUIDv4 string that uniquely identifies this finding. Must match the filename exactly (`workspace/findings/<id>.json`). Written once at creation by `/mantis-researcher` and never changed.
+</ParamField>
+
+<ParamField body="title" type="string" required>
+  A concise, human-readable summary of the vulnerability. For exploit chains, the title must explicitly contain the phrase `"Exploit Chain"` and list the constituent findings and their combined impact.
+</ParamField>
+
+<ParamField body="description" type="string" required>
+  A detailed explanation of the flaw, its root cause, and the mechanism by which it can be triggered.
+</ParamField>
+
+<ParamField body="code_paths" type="string[]" required>
+  Exact locations of the flaw in the form `path/to/file.ext:line` (e.g., `src/auth.c:145`). For exploit chains, this is the union of all paths involved across constituent findings.
+</ParamField>
+
+<ParamField body="impact" type="string" required>
+  A description of the potential consequence if the vulnerability is exploited (e.g., remote code execution, privilege escalation, data exfiltration).
+</ParamField>
+
+<ParamField body="severity" type="enum" required>
+  Initial severity estimate assigned by `/mantis-researcher`. One of:
+  - `CRITICAL`
+  - `HIGH`
+  - `MEDIUM`
+  - `LOW`
+</ParamField>
+
+<ParamField body="mitigation" type="string" required>
+  The recommended corrective code modification or configuration change.
+</ParamField>
+
+<ParamField body="history" type="object[]" required>
+  Chronological log of every action taken on this finding. Each entry is a `history_entry` object with the following fields:
+
+  | Field | Type | Required | Description |
+  |---|---|---|---|
+  | `stage` | string | ✓ | The pipeline stage that wrote this entry (e.g., `"researcher"`, `"reviewer"`, `"reproduce"`). |
+  | `action` | string | ✓ | A short verb describing what was done (e.g., `"created"`, `"status_updated"`). |
+  | `details` | string | ✓ | Free-form description of the change. |
+  | `pass_number` | integer | ✓ | Sequential pipeline pass number when this entry was written. |
+  | `timestamp` | string (date-time) | ✓ | ISO 8601 timestamp of when the entry was recorded. |
+  | `snapshot` | string | — | The `SNAPSHOT_ID` this action was performed against. Absent for legacy/unpinned actions. |
+
+  For exploit chains, the history must include an entry that details the chained UUIDs.
+</ParamField>
+
+<ParamField body="status" type="enum" required>
+  The current validity determination for this finding. One of:
+
+  - `VALID` — Confirmed real vulnerability, passed all triage constraints.
+  - `PROVISIONALLY_VALID` — Likely real but requires dynamic validation to confirm.
+  - `NEEDS_RESEARCH` — Inconclusive; requires deeper manual or automated review.
+  - `FALSE_POSITIVE` — Not a bug, or the threat model does not apply.
+  - `DUPLICATE` — This finding duplicates another. Requires `duplicate_of` to be set.
+</ParamField>
+
+<ParamField body="attacker_position" type="enum" required>
+  The starting network/physical position an attacker must occupy to exploit this finding. One of:
+
+  - `EXTERNAL` — Public internet, no prior access required.
+  - `INTERNAL_NETWORK` — Must be on the same internal network.
+  - `IN_CLUSTER` — Must be a workload running inside the same Kubernetes/container cluster.
+  - `LOCAL` — Must have local shell access to the machine.
+  - `HOST_SYSTEM` — Must already control the host OS (container escape scenario).
+  - `SUPPLY_CHAIN` — Must control an upstream dependency or build artifact.
+  - `PHYSICAL_TEMPORARY` — Must have temporary physical access to the device.
+  - `PHYSICAL_LONG_TERM` — Must have prolonged, unsupervised physical access.
+</ParamField>
+
+<ParamField body="privileges_required" type="enum" required>
+  The privilege level the attacker must hold before exploitation. One of:
+
+  - `NONE` — Unauthenticated or fully public access.
+  - `LOW` — Standard authenticated user (no elevated roles needed).
+  - `HIGH` — Administrative or elevated privileges required.
+</ParamField>
+
+<ParamField body="user_interaction" type="enum" required>
+  Whether a victim user must take an action (e.g., click a link) for the exploit to succeed. One of:
+
+  - `NONE` — No user interaction required.
+  - `REQUIRED` — A human victim must interact (e.g., open a file, visit a URL).
+</ParamField>
+
+---
+
+## Status Transition Flow
+
+A finding moves through a defined lifecycle as different pipeline skills process it. The `history` array records every transition.
+
+<Steps>
+  <Step title="Created (NEEDS_RESEARCH or PROVISIONALLY_VALID)">
+    `/mantis-researcher` writes the initial finding file with `status` set to `NEEDS_RESEARCH` or `PROVISIONALLY_VALID`. Core required fields are populated.
+  </Step>
+  <Step title="Reviewed">
+    `/mantis-review` applies 13 triage constraints and updates `status` to `VALID`, `FALSE_POSITIVE`, or leaves it as `NEEDS_RESEARCH`. A `triage_checklist` is added for non-chain findings. `DUPLICATE` status requires `duplicate_of` to be set.
+  </Step>
+  <Step title="Viability Assessed">
+    `/mantis-critic` sets `production_viability` to one of `VIABLE`, `NON_VIABLE`, `SAMPLE_OR_TEST`, or `CONDITIONAL_VIABLE`, and appends a `critic_reasoning`. Non-viable findings are written to `workspace/learnings.jsonl`.
+  </Step>
+  <Step title="Reproduced">
+    `/mantis-reproduce` attempts to build and run a proof-of-concept. On success, `repro_status`, `repro_file_path`, `run_command`, and `repro_output` are all written. The status `reproduced` requires all three evidence fields.
+  </Step>
+  <Step title="Patched">
+    `/mantis-patch` generates a fix, applies it to a shadow copy, and updates `patch_status`. The `patch_diff` field is written. For `VERIFIED_SECURE`, the re-attack loop must confirm `reattack_status: failed_to_bypass` with ≥ 3 variant attempts.
+  </Step>
+  <Step title="Calibrated">
+    `/mantis-calibrate` computes `impact_score`, `likelihood_score`, `mantis_risk_score`, `priority`, and `inferred_exposure`. A `calibration_checklist` is appended. The finding is now fully scored.
+  </Step>
+</Steps>
+
+---
+
+## Lifecycle Fields
+
+These fields are written by specific downstream skills and are absent until that skill processes the finding.
+
+### Validity & Reasoning
+
+<ParamField body="reasoning" type="string">
+  The reviewer's independent rationale for the `status` decision. Written by `/mantis-review`.
+</ParamField>
+
+<ParamField body="duplicate_of" type="string (uuid)">
+  Required when `status` is `DUPLICATE`. The UUID of the primary finding this duplicates.
+</ParamField>
+
+<ParamField body="possible_duplicate_of" type="string (uuid)">
+  A non-destructive advisory pointer to a finding that *might* be duplicated but could not be confirmed because the two findings were discovered against different or unknown snapshots. The finding stays active and is **not** filtered.
+</ParamField>
+
+<ParamField body="repro_hints" type="string">
+  Instructions for triggering the bug, including reached-sink evidence channels and execution telemetry (e.g., `build_profile`, `sanitizers_used`, `ingress_blocked`).
+</ParamField>
+
+### Production Viability
+
+<ParamField body="production_viability" type="enum">
+  Written by `/mantis-critic`. Whether the bug is triggerable in a release build. One of:
+  - `VIABLE` — Triggerable in a production release build.
+  - `NON_VIABLE` — Compiled out, blocked by the environment, or debug-only.
+  - `SAMPLE_OR_TEST` — Resides in test or example code (non-production).
+  - `CONDITIONAL_VIABLE` — Exploitable only under specific, non-default configurations or flags.
+</ParamField>
+
+<ParamField body="critic_reasoning" type="string">
+  Rationale written by `/mantis-critic` for the `production_viability` verdict (e.g., `"Not protected by allocator padding"`).
+</ParamField>
+
+### Reproduction
+
+<ParamField body="repro_status" type="enum">
+  The outcome of the reproduction attempt. One of:
+  - `reproduced` — Reached-sink evidence is **present**. Requires `repro_file_path`, `run_command`, and `repro_output`.
+  - `statically_confirmed` — Code-path analysis confirms the sink is reachable without dynamic execution. Requires evidence fields.
+  - `not_attempted` — No attempt made, or the build/environment failed (retry-eligible). Used when evidence is absent.
+  - `failed_to_reproduce` — A valid harness reached the sink but the bug did not trigger.
+
+  <Warning>
+    Record `reproduced` or `statically_confirmed` **only** when reached-sink evidence is present. Any non-zero build exit, `exit 127`, or `No such file` error must result in `not_attempted`, never `failed_to_reproduce`.
+  </Warning>
+</ParamField>
+
+<ParamField body="repro_file_path" type="string">
+  Path to the generated proof-of-concept script or payload. Required when `repro_status` is `reproduced`.
+</ParamField>
+
+<ParamField body="run_command" type="string">
+  The exact shell command used to execute the PoC. Required when `repro_status` is `reproduced`.
+</ParamField>
+
+<ParamField body="repro_output" type="string">
+  Combined stdout and stderr from the sandbox execution run. Required when `repro_status` is `reproduced`.
+</ParamField>
+
+<ParamField body="repro_snapshot_id" type="string">
+  The `SNAPSHOT_ID` the reproduction attempt was executed against. Absent means provenance is unknown; downstream skills must re-verify rather than trust `repro_status`.
+</ParamField>
+
+### Patching
+
+<ParamField body="patch_status" type="enum">
+  The outcome of the patching and re-attack verification loop. One of:
+  - `VERIFIED_SECURE` — The fix was applied and ≥ 3 re-attack variants all failed to bypass it.
+  - `MITIGATION_PROPOSED` — A mitigation was suggested but not dynamically verified.
+  - `VERIFICATION_INCOMPLETE` — Verification was attempted but not completed (e.g., fewer than 3 variants tested).
+  - `VERIFICATION_FAILED` — The patch did not block the original exploit.
+  - `ERROR` — An unexpected error occurred during patch or verification.
+</ParamField>
+
+<ParamField body="patch_diff" type="string">
+  The unified diff of the verified fix or mitigation recommendation. Required for findings that have been through the patch stage (except exploit chains).
+</ParamField>
+
+<ParamField body="patch_base_snapshot" type="string">
+  The `SNAPSHOT_ID` the `patch_diff` was generated and verified against. Absent means the patch base is unknown; `VERIFIED_SECURE` must not be trusted across a snapshot change.
+</ParamField>
+
+### Re-attack
+
+<ParamField body="reattack_status" type="enum">
+  The outcome of the variant-hunting re-attack against the patched shadow. One of:
+  - `failed_to_bypass` — All ≥ 3 variants failed to trigger the original vulnerability class on the patched shadow.
+  - `bypassed_patch` — At least one variant triggered the bug despite the patch.
+  - `inconclusive_baseline_changed` — The original (unpatched) baseline no longer triggers on the current snapshot. Mutually exclusive with `VERIFIED_SECURE`.
+
+  <Warning>
+    `failed_to_bypass` requires a non-empty `reattack_variants` array with **at least 3** valid variant inputs that all failed. A shorter set caps `patch_status` at `VERIFICATION_INCOMPLETE`.
+  </Warning>
+</ParamField>
+
+<ParamField body="reattack_file_path" type="string">
+  Path to the newly generated re-attack script. Required when `reattack_status` is set.
+</ParamField>
+
+<ParamField body="reattack_run_command" type="string">
+  The exact execution command for the re-attack. Required when `reattack_status` is set.
+</ParamField>
+
+<ParamField body="reattack_output" type="string">
+  Combined stdout and stderr from the re-attack run. Required when `reattack_status` is set.
+</ParamField>
+
+<ParamField body="reattack_variants" type="object[]">
+  Array of variant inputs attempted during re-attack. Each entry has:
+  - `description` (string, required) — What the variant does (e.g., `"off-by-one: len=bound+1"`).
+  - `triggered` (boolean, required) — Whether this variant triggered the original vulnerability class on the patched shadow.
+
+  Must contain ≥ 3 entries for `reattack_status: failed_to_bypass`. Absent for legacy findings (pre-variant-hunting).
+</ParamField>
+
+<ParamField body="reattack_snapshot_id" type="string">
+  The `SNAPSHOT_ID` the re-attack was executed against (the base snapshot of the patched shadow).
+</ParamField>
+
+---
+
+## Risk Scoring Fields
+
+These fields are written by `/mantis-calibrate` after all validation stages complete.
+
+<ParamField body="impact_score" type="integer (1–5)">
+  Calculated technical impact on the CIA triad. 1 = minimal, 5 = maximum.
+</ParamField>
+
+<ParamField body="likelihood_score" type="integer (1–5)">
+  Probability of exploitation based on proven exploitability evidence. 1 = very unlikely, 5 = trivially exploitable.
+</ParamField>
+
+<ParamField body="mantis_risk_score" type="number (0.1–10.0)">
+  Final calculated risk score. Formula: `Hazard = (impact_score + likelihood_score) × Multiplier`, then adjusted by an outrage factor. Range is 0.1–10.0.
+</ParamField>
+
+<ParamField body="priority" type="enum">
+  Qualitative priority bucket derived from `mantis_risk_score`. One of: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`.
+</ParamField>
+
+<ParamField body="inferred_exposure" type="enum">
+  The resolved network/trust exposure tier based on the threat model. One of:
+  - `EXPOSED` — Reachable from the public internet.
+  - `INTERNAL` — Reachable only from within the internal network.
+  - `PRIVILEGED` — Reachable only from a privileged or trusted context.
+</ParamField>
+
+<ParamField body="availability_tier" type="enum | null">
+  Availability criticality of the affected component, if the finding's impact includes availability. One of: `CRITICAL` (24/7 immediate impact), `STANDARD` (short disruptions tolerable), `LOW_CRITICALITY` (non-blocking), or `null`.
+</ParamField>
+
+<ParamField body="outrage_commentary" type="string">
+  Reasoning about the outrage factor used in the risk formula (`Risk = Hazard + Outrage`).
+</ParamField>
+
+<ParamField body="executive_summary" type="string">
+  A high-level summary of the risk suitable for non-technical stakeholders.
+</ParamField>
+
+<ParamField body="sanity_triage_applied" type="string | null">
+  Semicolon-separated list of sanity triage caps and downgrades that fired during calibration.
+</ParamField>
+
+---
+
+## Identity & Lineage Fields
+
+These fields support cross-pass deduplication, finding lineage tracking, and SAST tool integration.
+
+<ParamField body="discovery_commit" type="string | null">
+  The `SNAPSHOT_ID` of the snapshot this finding was **first** discovered against. Written once at creation by `/mantis-researcher` and preserved verbatim across all retries and archival.
+
+  This is the **trust anchor** for the Snapshot Match Check. A consumer trusts a prior verdict on a finding **only** when `discovery_commit` is present and **exactly equals** the current pass `SNAPSHOT_ID` (no fuzzy comparison). Absent, empty, or null means the finding is treated as `NOT_MATCHED` → re-research/re-verify. The literal string `"MIXED"` (set by `/mantis-chain` when constituents span different snapshots) is also treated as `NOT_MATCHED`.
+</ParamField>
+
+<ParamField body="signature" type="string">
+  Deterministic, stable content-identity signature computed once at creation. Formula: first 16 hex chars of `sha256(normalized_title + '|' + cwe_part + '|' + primary_target)`. Used for cross-pass deduplication without UUID collisions. Absent → consumers fall back to UUID-based deduplication (today's behavior).
+</ParamField>
+
+<ParamField body="lineage_id" type="string (uuid)">
+  Links findings that represent the same underlying bug across different passes or snapshots. Set by `/mantis-researcher` at creation: if an archived finding with the same `signature` exists, its `lineage_id` is copied; otherwise a fresh UUIDv4 is minted. Absent → consumers fall back to `id`-based folding.
+</ParamField>
+
+<ParamField body="cwe" type="string | null">
+  CWE identifier for this vulnerability class (e.g., `"CWE-787"`). Used in `signature` computation. Absent → signature falls back to `title + primary_target`.
+</ParamField>
+
+<ParamField body="sast_provenance" type="object">
+  Present only when the finding was seeded from an external SAST tool via the SAST seeding adapter. This is an **informational** field only — it does not affect any gate or trust anchor. Fields:
+
+  | Field | Type | Description |
+  |---|---|---|
+  | `tool` | string | SAST tool name (e.g., `"codeql"`, `"semgrep"`). |
+  | `rule_id` | string | Rule identifier in the tool's rule set. |
+  | `rule_name` | string | Human-readable rule name. |
+  | `original_severity` | string | Severity as reported by the SAST tool, before Mantis remapping. |
+  | `scan_snapshot_id` | string | `SNAPSHOT_ID` the scan was run against. |
+  | `line_verified` | boolean | Whether the adapter verified the file:line exists under `CODE_ROOT`. |
+  | `message` | string | Original SAST finding message. |
+</ParamField>
+
+---
+
+## Exploit Chain Fields
+
+<ParamField body="constituent_findings" type="string[] (uuid[])">
+  Array of finding UUIDs that form this exploit chain. Present only on chain "Super Findings" created by `/mantis-chain`. When this array is non-empty, the triage checklist requirement is waived (reviewer runs before the chainer), but the calibration checklist is still required.
+</ParamField>
+
+---
+
+## Minimal Valid Finding Example
+
+The following is the smallest valid finding JSON that satisfies all required fields:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "title": "SQL Injection in User Login Endpoint",
+  "description": "The login handler passes user-supplied input directly to a raw SQL query without parameterization, enabling an attacker to bypass authentication or exfiltrate the users table.",
+  "code_paths": ["src/api/auth_handler.py:87"],
+  "impact": "Authentication bypass and full database read access for unauthenticated users.",
+  "severity": "CRITICAL",
+  "mitigation": "Replace the raw string-formatted SQL query with a parameterized query using the db library's `execute(query, params)` interface.",
+  "attacker_position": "EXTERNAL",
+  "privileges_required": "NONE",
+  "user_interaction": "NONE",
+  "status": "PROVISIONALLY_VALID",
+  "history": [
+    {
+      "stage": "researcher",
+      "action": "created",
+      "details": "Initial finding created during file-by-file triage of src/api/auth_handler.py.",
+      "pass_number": 1,
+      "timestamp": "2025-01-15T10:23:00Z"
+    }
+  ]
+}
+```
+
+After `/mantis-reproduce` confirms the bug, the finding grows to include:
+
+```json
+{
+  "repro_status": "reproduced",
+  "repro_file_path": "workspace/repro/a1b2c3d4_sqli.py",
+  "run_command": "python3 workspace/repro/a1b2c3d4_sqli.py",
+  "repro_output": "HTTP 200 OK\n{\"user\": \"admin\", \"role\": \"superuser\"}",
+  "repro_snapshot_id": "abc123def456:7890abcdef01"
+}
+```

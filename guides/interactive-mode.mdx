@@ -1,0 +1,131 @@
+---
+title: "Run Mantis in Interactive Mode"
+sidebarTitle: "Interactive Mode"
+description: "Step-by-step guide to running the Mantis security pipeline interactively with human-in-the-loop approval before every sensitive action."
+---
+
+Interactive Mode is the recommended starting point for anyone new to Mantis. In this mode you drive the pipeline manually — typing each slash command one at a time in your coding agent's CLI — and the agent pauses before executing sensitive operations like writing files or running generated code. No auto-approval flags are used, so you retain full control over every stage and can inspect what the AI intends to do before it acts.
+
+<Warning>
+  **Never use `--yolo` or `--dangerously-skip-permissions` in Interactive Mode.** These flags suppress human confirmation prompts. They are only safe inside a [fully hardened unattended environment](/guides/unattended-gce-deployment), where a dedicated GCE VM, VPC isolation, and least-privilege IAM are already in place.
+</Warning>
+
+## What Interactive Mode Is
+
+Interactive Mode means you launch your coding agent normally — Gemini CLI, Antigravity CLI, or any other compatible framework — without any automatic-approval flags. You then type the Mantis slash commands one by one into the interactive prompt. Between each command the agent completes that stage, writes its outputs to the shared `workspace/` directory, and waits for your next input.
+
+Because no orchestrator is driving the loop, this mode runs in **MODE-OFF** by default: a point-in-time review of whatever is currently on disk, with all finding verdicts permitted. The snapshot model is disabled, so mid-run edits to the target are not frozen — but the pipeline does not deadlock waiting for a snapshot. To enable pinned snapshot passes on a living codebase, use `/mantis-meta-agent` with `--sync` instead.
+
+<Info>
+  Mantis works with Gemini CLI, Antigravity CLI, Google ADK, and other coding agent frameworks. Install the skills via `npx skills add google/mantis`.
+</Info>
+
+## The Full Skill Sequence
+
+Type each command individually inside the interactive UI prompt. You do not need to run every stage — the optional stages are clearly marked.
+
+```text
+# 0. (Optional) Analyze VCS history and extract past vulnerabilities
+/mantis-history
+
+# 0.5 (Optional) Build a content-addressed semantic-unit index
+/mantis-structural-index
+
+# 1. (Optional) Generate mantis-summary.md directory maps
+/mantis-summarize
+
+# 2. Synthesize codebase structure and historical learnings into the Markdown KB
+/mantis-architecture
+
+# 3. Build the living threat model from the KB
+/mantis-threat-model
+
+# 4. Map target boundaries and generate the scanning roadmap
+/mantis-plan
+
+# 5. Run the security flaw sweep using injected context
+/mantis-researcher
+
+# 6. Consolidate overlapping findings and deduplicate bugs
+/mantis-dedupe
+
+# 7. Verify code validity and filter false positives
+/mantis-review
+
+# 8. Eliminate non-viable production issues
+/mantis-critic
+
+# 9. Generate proof-of-concept crash reproducers and run them in sandboxes
+/mantis-reproduce
+
+# 10. Combine validated findings into multi-step exploit chains
+/mantis-chain
+
+# 11. Apply minimal fixes and verify they block the crash reproducer
+/mantis-patch
+
+# 12. Calculate final matrix risk ratings
+/mantis-calibrate
+
+# 13. Extract insights from trajectories and append to the learnings inbox
+/mantis-reflect
+
+# 14. Generate the human-readable security review packet
+/mantis-report
+```
+
+After `/mantis-report` completes, manually review the report at `workspace/report/review_packet-latest.md`. Apply and commit approved patches. To continue with another pass, archive `workspace/findings/` so it is empty, then optionally sync the target non-destructively (e.g. `git fetch && git merge --ff-only`) and re-run `/mantis-architecture` to refresh the Knowledge Base before looping back to step 2.
+
+## The "No Host-Run" Rule
+
+AI models can generate code payloads that break the host system or attempt unexpected actions. The `/mantis-reproduce` and `/mantis-patch` skills are explicitly instructed to run all scripts and payloads inside isolated container environments with networking disabled (`--network none`). However, agents are non-deterministic and may occasionally attempt to skip this step.
+
+<Warning>
+  **Never execute AI-generated scripts directly on your host machine.** Only run generated code inside a sandboxed container or VM. Even with correct instructions, an AI agent may occasionally bypass intended constraints if the local environment permits it. Always run Mantis inside a dedicated, isolated VM to provide a boundary the agent cannot escape.
+</Warning>
+
+When running in Interactive Mode, you can inspect each action before approving it. If an agent proposes running a script outside a sandbox, reject the action and prompt it to use the container instead.
+
+## Best Practices for Interactive Mode
+
+<Steps>
+  <Step title="Start Narrow">
+    Begin with a single high-risk file rather than a full repository sweep. For example, point `/mantis-plan` at `src/crypto/` or `api/` rather than running an entire codebase scan. Starting narrow lets you tune the pipeline — calibrate false-positive filters, verify sandbox behavior, and understand the output format — before committing to a long run.
+  </Step>
+  <Step title="Review Each Stage's Output">
+    After every slash command, read what was written to `workspace/` before proceeding. Check `workspace/findings/` after `/mantis-researcher`, inspect `workspace/plan.json` after `/mantis-plan`, and read individual finding JSON files after `/mantis-review` and `/mantis-critic`. This lets you catch hallucinations or misconfigurations early rather than discovering them at the report stage.
+  </Step>
+  <Step title="Iterate Small">
+    If the agent produces poor findings or misses obvious issues, do not immediately expand scope. Instead, refine the negative-validation filters in `/mantis-review`, improve the threat model in `/mantis-threat-model`, or re-run a single stage with adjusted context. Running a small scan, triaging a few items, and using feedback to improve the pipeline is more effective than opening the full codebase on day one.
+  </Step>
+  <Step title="Use /mantis-configure First">
+    Before starting a scan, run the optional configuration step to verify your sandbox and model are ready:
+    ```bash
+    python3 reference/scripts/configure.py --test
+    ```
+    This runs a fast preflight check (~1 second) that validates LLM credentials and sandbox availability without starting a campaign.
+  </Step>
+  <Step title="Gate Sensitive Stages">
+    Pay particular attention when the agent reaches `/mantis-reproduce` and `/mantis-patch`. These stages write files and execute generated code. In Interactive Mode the agent will pause and ask for your approval before each file write or execution. Read the proposed command carefully before approving.
+  </Step>
+</Steps>
+
+## Understanding What the Agent Pauses On
+
+Your coding agent should pause and prompt for human approval before:
+
+- Writing to files (especially during `/mantis-reproduce` and `/mantis-patch`)
+- Running any shell command or generated script
+- Executing code inside a sandbox container
+
+<Tip>
+  If your agent is not pausing before executing commands, check that you have not accidentally passed an auto-approval flag (`--yolo`, `--dangerously-skip-permissions`, or equivalent) when starting the CLI session.
+</Tip>
+
+## About `--yolo` and `--dangerously-skip-permissions`
+
+These flags instruct the coding agent to skip all interactive confirmation prompts and execute every proposed action automatically. They exist for unattended production deployments where human-in-the-loop review is replaced by a hardened VM boundary, network isolation, and restricted IAM.
+
+<Warning>
+  **Do not use these flags on your local development machine or any machine with access to production systems.** Without the [hardened GCE environment](/guides/unattended-gce-deployment), these flags expose your host to prompt injection, runaway script execution, and potential data loss. The flags are only safe when the surrounding environment enforces the security boundary the agent cannot enforce on its own.
+</Warning>

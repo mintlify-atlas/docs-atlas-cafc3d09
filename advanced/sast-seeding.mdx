@@ -1,0 +1,259 @@
+---
+title: "Seed the Pipeline with External SAST Tool Findings"
+sidebarTitle: "SAST Seeding"
+description: "Ingest CodeQL, Semgrep, and other SAST tool findings into Mantis via the pipeline adapter's platform-agnostic JSONL IR format for unified triage."
+---
+
+AI-based discovery is powerful at finding complex, multi-step vulnerabilities and novel attack patterns that static tools miss. Traditional SAST tools, however, excel at different things: whole-program taint tracking, known-pattern matching at scale, and deep interprocedural analysis for vulnerability classes like SQL injection, path traversal, and use-after-free. The SAST Seeding pattern, defined as Guideline 8 of the Pipeline Adapter, lets you combine both: external SAST tool findings enter the Mantis pipeline as candidates that must earn their verdict through the same unchanged downstream gates that LLM-generated findings pass through. This is purely additive — no existing skills are modified.
+
+<Note>
+SAST seeding is **opt-in and default off**. If `workspace/sast_findings.jsonl` does not exist, the pipeline proceeds normally with zero impact. The seeding skill writes nothing until both a JSONL producer and the harness invocation are wired up.
+</Note>
+
+## How the Pattern Works
+
+External SAST findings enter the pipeline between Stage 6 (Research) and Stage 7 (Dedupe) via a dedicated `/mantis-sast-seed` skill that your harness invokes. The seeded findings become indistinguishable from researcher-generated findings in `workspace/findings/` and are processed through all downstream gates identically.
+
+```
+SAST Tool Output → IR Converter → sast_findings.jsonl
+                                          ↓
+                              /mantis-sast-seed (invoked by harness)
+                                          ↓
+                            workspace/findings/<uuid>.json
+                              [PROVISIONALLY_VALID or NEEDS_RESEARCH]
+                                          ↓
+                              /mantis-dedupe → /mantis-review
+                              → /mantis-critic → /mantis-reproduce
+                              → /mantis-calibrate → /mantis-report
+```
+
+The seed skill does three things before writing any finding:
+1. **Provenance verification** — confirms the SAST scan ran against the same pinned code snapshot the pipeline is analyzing
+2. **Allow-list filtering** — caps the number of findings entering the pipeline to prevent retry-budget starvation
+3. **Line-existence verification** — re-grounds each reported location against the actual source files to catch stale findings
+
+## The JSONL Intermediate Representation
+
+The pipeline adapter uses a **platform-agnostic JSONL IR format**, not SARIF. Any SAST tool's native output can be converted to this format by a thin wrapper — this is the harness's responsibility, not the skill's. The skill reads only the IR.
+
+### IR File Structure
+
+The file `workspace/sast_findings.jsonl` has a provenance header on line 1, followed by one finding per subsequent line:
+
+<CodeGroup>
+```json Provenance Header (line 1)
+{
+  "_provenance": true,
+  "scan_snapshot_id": "abc123def456",
+  "tool": "codeql",
+  "tool_version": "2.15.0",
+  "scan_timestamp": "2026-07-22T12:00:00Z"
+}
+```
+
+```json Single-Location Finding
+{
+  "rule_id": "cpp/sql-injection",
+  "rule_name": "SQL injection via string concatenation",
+  "cwe": "CWE-89",
+  "severity": "HIGH",
+  "code_paths": ["src/db.c:42"],
+  "message": "User-controlled input concatenated into SQL query"
+}
+```
+
+```json Multi-Location Finding (Taint Flow)
+{
+  "rule_id": "py/taint",
+  "rule_name": "Path traversal",
+  "cwe": "CWE-22",
+  "severity": "CRITICAL",
+  "code_paths": [
+    "src/input.py:15",
+    "src/router.py:88",
+    "src/filesystem.py:204"
+  ],
+  "message": "Tainted data flows from user input to file open"
+}
+```
+</CodeGroup>
+
+### Required and Optional Fields
+
+<Tabs>
+  <Tab title="Required Fields">
+    | Field | Type | Description |
+    |---|---|---|
+    | `rule_id` | string | Rule identifier in the SAST tool's rule set |
+    | `severity` | string | One of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW` |
+    | `code_paths` | array | Array of `"file:line"` strings, snapshot-relative |
+    | `message` | string | Finding message from the SAST tool |
+  </Tab>
+  <Tab title="Optional Fields">
+    | Field | Type | Description |
+    |---|---|---|
+    | `rule_name` | string | Human-readable rule name |
+    | `cwe` | string | CWE identifier (e.g. `"CWE-89"`) |
+  </Tab>
+</Tabs>
+
+### Converting SAST Tool Output to IR
+
+The harness is responsible for converting each tool's native format to the IR. The skill itself only reads the IR.
+
+<Tabs>
+  <Tab title="SARIF → IR">
+    Extract from each SARIF `result` object:
+    - `ruleId` → `rule_id`
+    - `level` → `severity` (see mapping below)
+    - `locations[0].physicalLocation` → `code_paths` (as `"uri:lineStart"`)
+    - `message.text` → `message`
+    - Rule metadata `name` → `rule_name`
+    - Rule metadata `cwe` tag → `cwe`
+
+    Severity mapping: `error` → `HIGH`, `warning` → `MEDIUM`, `note` → `LOW`
+  </Tab>
+  <Tab title="Semgrep JSON → IR">
+    Extract from each Semgrep `result` object:
+    - `check_id` → `rule_id`
+    - `extra.severity` → `severity` (see mapping below)
+    - `path` + `start.line` → `code_paths` (as `"path:line"`)
+    - `extra.message` → `message`
+    - Rule metadata `metadata.cwe` → `cwe`
+
+    Severity mapping: `ERROR` → `HIGH`, `WARNING` → `MEDIUM`, `INFO` → `LOW`
+  </Tab>
+</Tabs>
+
+## Provenance Verification and Finding Status
+
+The `scan_snapshot_id` in the IR provenance header records which snapshot the SAST scan ran against. The seed skill compares this to the current pipeline pass's snapshot ID and assigns one of five provenance states:
+
+| Provenance State | Condition | `discovery_commit` | Finding Status |
+|---|---|---|---|
+| **MODE-OFF** | No `active_snapshot` in state | Omitted | `PROVISIONALLY_VALID` |
+| **HALT** | `snapshot_pinned` is false | Omitted | `NEEDS_RESEARCH` |
+| **VERIFIED** | `scan_snapshot_id` equals `SNAPSHOT_ID` | Stamped | `PROVISIONALLY_VALID` |
+| **DRIFT** | `scan_snapshot_id` present but differs | Omitted | `NEEDS_RESEARCH` |
+| **UNVERIFIED** | `scan_snapshot_id` absent | Omitted | `NEEDS_RESEARCH` |
+
+<Info>
+When `discovery_commit` is omitted, downstream stages treat the finding as NOT_MATCHED (the conservative branch). The finding must earn its verdict entirely through the unchanged downstream gates — it cannot shortcut any pipeline stage.
+</Info>
+
+Seeded findings with `PROVISIONALLY_VALID` status have been verified against the pinned code snapshot. Those with `NEEDS_RESEARCH` status require the LLM researcher to confirm the finding is still present in the current code before it can proceed through reproduction and patching.
+
+## The `sast_provenance` Object
+
+Every seeded finding includes a `sast_provenance` field that records the tool origin. This field is **informational only** — it does not affect any safety-critical pipeline gate or verdict. The finding's `discovery_commit` is the field that governs snapshot matching in downstream stages.
+
+```json
+"sast_provenance": {
+  "tool": "codeql",
+  "rule_id": "cpp/sql-injection",
+  "rule_name": "SQL injection via string concatenation",
+  "original_severity": "HIGH",
+  "scan_snapshot_id": "abc123def456",
+  "line_verified": true,
+  "message": "User-controlled input concatenated into SQL query"
+}
+```
+
+<ParamField path="tool" type="string">
+  The name of the SAST tool that produced the finding (e.g., `"codeql"`, `"semgrep"`).
+</ParamField>
+
+<ParamField path="rule_id" type="string">
+  The rule identifier from the SAST tool's rule set.
+</ParamField>
+
+<ParamField path="rule_name" type="string">
+  Human-readable rule name from the SAST tool, if available.
+</ParamField>
+
+<ParamField path="original_severity" type="string">
+  The severity as reported by the SAST tool before any Mantis normalization.
+</ParamField>
+
+<ParamField path="scan_snapshot_id" type="string">
+  The snapshot ID the SAST scan ran against, extracted from the IR provenance header.
+</ParamField>
+
+<ParamField path="line_verified" type="boolean">
+  Whether each `code_paths` entry's file and line number were verified to exist in the pinned `CODE_ROOT`.
+</ParamField>
+
+<ParamField path="message" type="string">
+  The SAST tool's original finding message, also copied to `repro_hints` to assist the reproduction agent.
+</ParamField>
+
+## Allow-List Configuration
+
+Without filtering, a SAST tool can emit thousands of findings. Each finding that reaches the `/mantis-reproduce` stage consumes up to 6 reproduction attempts from a hard per-finding budget. The allow-list prevents noise from starving the retry budget across the entire pipeline.
+
+Create `workspace/sast_allowlist.json` to configure filtering:
+
+```json
+{
+  "enabled": true,
+  "severity_filter": ["CRITICAL", "HIGH"],
+  "cwe_allowlist": {
+    "enabled": true,
+    "cwes": ["CWE-89", "CWE-78", "CWE-79", "CWE-22", "CWE-787", "CWE-416", "CWE-502"]
+  },
+  "rule_allowlist": {
+    "enabled": false,
+    "rules": []
+  },
+  "per_rule_cap": 5,
+  "total_cap": 50
+}
+```
+
+When this file is absent, the defaults apply: `CRITICAL` and `HIGH` severity only, `per_rule_cap` of 5 findings per rule, and a `total_cap` of 50 findings in total. Filters are applied in order: severity filter → CWE allowlist → rule allowlist → per-rule cap → total cap.
+
+## Pipeline Integration
+
+<Steps>
+  <Step title="Run the SAST tool against the pinned CODE_ROOT">
+    The harness or an external CI/CD step runs the SAST tool against the pinned snapshot root and converts its output to `workspace/sast_findings.jsonl`. The `scan_snapshot_id` in the provenance header must match the pipeline's current `SNAPSHOT_ID` for findings to achieve `PROVISIONALLY_VALID` status.
+  </Step>
+  <Step title="Invoke the seed skill between Research and Dedupe">
+    The harness calls `/mantis-sast-seed` after `/mantis-researcher` completes and before `/mantis-dedupe` runs:
+
+    ```text
+    /mantis-sast-seed --snapshot_root=<CODE_ROOT> \
+                      --snapshot_id=<SNAPSHOT_ID> \
+                      --state_root=<workspace_parent>
+    ```
+  </Step>
+  <Step title="Dedupe merges seeded and LLM findings">
+    `/mantis-dedupe` processes all findings in `workspace/findings/` identically — seeded findings are clustered with LLM-generated findings using the same signature-based matching and Block B pairwise snapshot check. No special handling is needed.
+  </Step>
+  <Step title="Downstream gates apply unchanged">
+    All stages from `/mantis-review` onward apply their full logic to seeded findings. The 13-rule negative filter, production viability critic, reproduction evidence gate, and re-attack verification all apply without modification.
+  </Step>
+</Steps>
+
+## Safety Guarantees
+
+The adapter enforces the following safety invariants:
+
+<CardGroup cols={2}>
+  <Card title="Purely additive" icon="plus">
+    Seeded findings are candidates that must earn their verdict. No existing skill files are modified. The adapter writes to `workspace/findings/` before `/mantis-dedupe` runs and is otherwise invisible to the pipeline.
+  </Card>
+  <Card title="No false VERIFIED_SECURE" icon="shield-check">
+    Seeded findings start at `PROVISIONALLY_VALID` or `NEEDS_RESEARCH`. They can never reach `VERIFIED_SECURE` without passing through the full patch and re-attack pipeline.
+  </Card>
+  <Card title="No false failed_to_reproduce" icon="x">
+    Seeded findings reaching the reproduce stage are subject to the same Block F reached-sink evidence gate. A missing setup or environment failure produces `not_attempted`, never `failed_to_reproduce`.
+  </Card>
+  <Card title="No dropped regressions" icon="arrow-rotate-left">
+    If a SAST-seeded finding matches an archived finding with a different `discovery_commit`, Block B returns NOT_MATCHED and the finding stays active with a `possible_duplicate_of` hint.
+  </Card>
+</CardGroup>
+
+<Warning>
+The conservative default for seeded findings is `attacker_position: "EXTERNAL"`, `privileges_required: "NONE"`, and `user_interaction: "NONE"` — the maximum-severity triple. This is intentional to prevent under-rating (INV-2). The `/mantis-review` and `/mantis-critic` stages **must** refine these fields before `/mantis-calibrate` runs, or seeded findings will be over-rated. Always allow the full pipeline to run before acting on seeded finding risk scores.
+</Warning>

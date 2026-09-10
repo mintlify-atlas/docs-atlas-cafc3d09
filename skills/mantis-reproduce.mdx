@@ -1,0 +1,324 @@
+---
+title: "/mantis-reproduce: Proof-of-Concept Crash Reproducer"
+sidebarTitle: "/mantis-reproduce"
+description: "Write and execute proof-of-concept reproducers inside isolated sandboxes to empirically verify security findings, with tiered escalation from micro-harness to full service."
+---
+
+Static analysis can confirm a flaw exists in code, but it cannot prove that
+flaw is triggerable at runtime. `/mantis-reproduce` closes that gap by
+designing and executing proof-of-concept (PoC) reproducers inside isolated
+sandbox environments. It operates a tiered escalation ladder — starting with a
+lightweight unit-level micro-harness and escalating to a full sandboxed
+service — to iteratively confirm that a vulnerability fires through the public
+API. It also supports a `--reattack` mode where it runs after `/mantis-patch`
+to verify that a patch genuinely removes the vulnerability rather than merely
+deflecting the original PoC. Use it on `VALID` or `PROVISIONALLY_VALID`
+findings after `/mantis-critic` assigns a viable status. Do not use it for
+initial code auditing or for generating patches.
+
+## Command
+
+```
+/mantis-reproduce [--reattack] [--finding_id=<uuid>] [--force]
+                  [--target_root=<path>] [--state_root=<path>]
+                  [--snapshot_root=<path>] [--snapshot_id=<id>]
+                  [--snapshot_pinned=<true|false>]
+```
+
+<ParamField path="--reattack" type="flag" optional>
+  Run in patch-verification mode. Re-executes the PoC and ≥ 3 boundary-mutated
+  variants against the patched shadow to confirm the patch holds. Requires
+  `--finding_id`. Does not modify `repro_*` fields.
+</ParamField>
+
+<ParamField path="--finding_id" type="string (UUID)" optional>
+  UUID of a specific finding to reproduce. **Required** when `--reattack` is
+  specified. When absent, the skill processes all eligible findings.
+</ParamField>
+
+<ParamField path="--force" type="flag" optional>
+  Override standard eligibility filters for a targeted normal run. Bypasses
+  the `status` and `production_viability` checks.
+</ParamField>
+
+<ParamField path="--target_root" type="string" optional>
+  AUTHORITATIVE path to the target codebase under test. Overrides
+  `--snapshot_root` and state fallback (Block A step 1a). The sentinel check
+  is skipped for this tree — use when running against a patched shadow during
+  re-attack verification.
+</ParamField>
+
+<ParamField path="--state_root" type="string" default=".">
+  Path to the Mantis state directory containing `workspace/`.
+</ParamField>
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Root of the pinned immutable code snapshot for this pass. Consumed by Block A
+  when `--target_root` is not supplied.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The `SNAPSHOT_ID` of the pinned snapshot, used by Block A (sentinel) and
+  Block B (snapshot match check).
+</ParamField>
+
+<ParamField path="--snapshot_pinned" type="boolean" optional>
+  When `false` (set by `/mantis-patch` during re-attack on a patched shadow),
+  the reproduce sub-agent skips the snapshot sentinel/match check for this
+  invocation.
+</ParamField>
+
+## Input / Output Contract
+
+<Tabs>
+  <Tab title="Reads">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/*.json` | Viable/conditional findings eligible for reproduction |
+    | `target_root/` | Repository source files to analyze trigger paths |
+    | `workspace/archive/.repro_attempts.json` | Per-finding attempt cache (snapshot-aware `{count, last_snapshot}`) |
+    | `workspace/.mantis_state.json` | Current `pass_number` and `active_snapshot` |
+  </Tab>
+  <Tab title="Writes (normal run)">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/reproducers/poc_<uuid>.py` (or `.payload`) | Self-contained PoC or raw crash payload |
+    | `workspace/findings/<id>.json` | Updated: `repro_status`, `repro_file_path`, `run_command`, `repro_output`, `repro_snapshot_id`, `repro_hints` |
+    | `workspace/archive/.repro_attempts.json` | Attempt cache updated atomically |
+  </Tab>
+  <Tab title="Writes (--reattack)">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/reproducers/reattack_variant_<uuid>_<N>.py` | One script per variant |
+    | `workspace/findings/<id>.json` | Updated: `reattack_status`, `reattack_file_path`, `reattack_run_command`, `reattack_output`, `reattack_variants`, `reattack_snapshot_id` (never touches `repro_*` or `status`) |
+  </Tab>
+</Tabs>
+
+## Usage
+
+**Normal reproduction run (all eligible findings):**
+
+```
+/mantis-reproduce \
+  --snapshot_root=/tmp/mantis_snapshots/pass_3 \
+  --snapshot_id=abc123def456 \
+  --state_root=/workspace
+```
+
+**Targeted reproduction (single finding):**
+
+```
+/mantis-reproduce \
+  --finding_id=550e8400-e29b-41d4-a716-446655440000 \
+  --snapshot_id=abc123def456
+```
+
+**Re-attack after patching (called by `/mantis-patch`):**
+
+```
+/mantis-reproduce \
+  --reattack \
+  --finding_id=550e8400-e29b-41d4-a716-446655440000 \
+  --target_root=/tmp/shadow_patched \
+  --snapshot_pinned=false \
+  --state_root=/workspace
+```
+
+## Tiered Iterative Reproduction Strategy
+
+Each reproducer follows a **depth-first escalation ladder** from lightweight
+unit harness to full sandboxed service, refining the payload at each tier
+before escalating.
+
+<Steps>
+  <Step title="Tier 1 — Micro-Harness / Sink Logic Validation">
+    Construct a lightweight test that calls the vulnerable function or module
+    **directly**, bypassing all routing and serialization layers. This validates
+    that the core bug hypothesis is sound in isolation. Used for stepping-stone
+    confidence only — **never** the basis for a final verdict.
+  </Step>
+  <Step title="Tier 2 — Subsystem / Interface Validation">
+    Pass the payload through input serialization, parsers, routing, and auth
+    wrappers to verify the input survives intermediate processing without
+    sanitization or truncation. Confirms the attack surface is reachable before
+    full end-to-end execution.
+  </Step>
+  <Step title="Tier 3 — Full Sandboxed Service / E2E Validation">
+    Execute the self-contained PoC against the target service via **public
+    APIs** inside the isolated sandbox (Docker, QEMU, VM). Only a Tier-3
+    execution can yield an authoritative `reproduced` verdict and counts toward
+    the per-finding attempt cap in `.repro_attempts.json`.
+  </Step>
+</Steps>
+
+<Warning>
+  **Tier-1 Hard Gate:** You must **never** record `repro_status = "reproduced"`
+  or `"statically_confirmed"` based on a Tier-1 or Tier-2 execution. If a crash
+  can only be achieved by compiling a direct-call harness that feeds a
+  private/static function and cannot be escalated to Tier 3, record
+  `repro_status = "failed_to_reproduce"` citing `"Internal Invariant Protection"`.
+</Warning>
+
+When subagents are available, multiple **Parallel Trajectory Search** workers
+can be deployed concurrently, each taking a different logical approach.  The
+first successful trajectory is adopted immediately.
+
+## Reproduction Status Values
+
+<CardGroup cols={2}>
+  <Card title="reproduced" icon="circle-check">
+    The PoC successfully triggered the vulnerability through the public API in
+    the sandboxed environment, with reached-sink evidence present.
+  </Card>
+  <Card title="statically_confirmed" icon="book">
+    Reproduction was impossible due to environmental constraints (e.g., missing
+    hardware emulators, unavailable external services) but the flaw is
+    statically obvious (e.g., hardcoded credentials). Strongly discouraged —
+    use only as a last resort.
+  </Card>
+  <Card title="not_attempted" icon="clock">
+    Reproduction was skipped due to infrastructure setup failure, timeout,
+    explicit skip configuration, or HALT mode. Retry-eligible — does NOT consume
+    a meaningful attempt against the hard ceiling of 6.
+  </Card>
+  <Card title="failed_to_reproduce" icon="circle-xmark">
+    The harness provably reached the vulnerable entrypoint (reached-sink evidence
+    present) but the bug did not fire. A definitive negative that increments the
+    attempt counter.
+  </Card>
+</CardGroup>
+
+## Reached-Sink Evidence Gate
+
+Before recording any negative outcome (`failed_to_reproduce` or, in re-attack
+mode, `failed_to_bypass`), the skill applies a mechanical evidence gate:
+
+<Tabs>
+  <Tab title="Script / Source Harness (Channel A)">
+    The harness must write the exact bytes `MANTIS_REACHED_ENTRYPOINT` to a
+    sidecar sentinel file and `flush+fsync` **before** invoking the sink. A
+    file survives a crash that truncates buffered stdout, making it reliable
+    evidence of actual sink reachability — not just launch success.
+  </Tab>
+  <Tab title="Binary / Firmware / Raw Payload (Channel B)">
+    Reached-sink evidence is a crash backtrace or sanitizer frame (ASan/UBSan/
+    MSan/TSan) from the target itself that **explicitly names the target sink
+    function**. A wrapper marker written by you before invoking the target is
+    setup evidence only — it proves "launch attempted," not "sink reached."
+  </Tab>
+</Tabs>
+
+| Evidence state | Normal run outcome | Re-attack outcome |
+|---------------|-------------------|-------------------|
+| **PRESENT** (channel A or B) | `reproduced` or `statically_confirmed` permitted | `failed_to_bypass` or `bypassed_patch` permitted |
+| **ABSENT** (build error, exit 127, `No such file`) | `not_attempted` (retry-eligible) | leave `reattack_status` unset with `setup_failed` note |
+
+<Warning>
+  In HALT mode (`active_snapshot` present, `snapshot_pinned = false`), the
+  skill **must not** record `failed_to_reproduce` or `failed_to_bypass`. A
+  negative result against a possibly-drifted tree cannot be trusted as
+  authoritative. Record `not_attempted` instead.
+</Warning>
+
+## Variant-Hunting Re-Attack (`--reattack`)
+
+When invoked with `--reattack`, the skill must author and execute **N ≥ 3
+boundary-mutated variant inputs** in addition to re-running the original PoC.
+The goal is to detect over-narrow patches that guard only the exact PoC bytes.
+
+**Variants are bug-class-aware:**
+
+<Tabs>
+  <Tab title="Memory Safety">
+    Off-by-one (`len = bound ± 1`), size mutations (`len = 0`, `len = SIZE_MAX`,
+    sign flips), alternate paths to the same sink (different API endpoint, file
+    format variant, protocol command), type confusion / width mismatch variants.
+  </Tab>
+  <Tab title="Logic / Auth / Injection">
+    Alternate endpoints/parameters (`/api/v2/echo` when PoC targets
+    `/api/v1/echo`), equivalent payloads (`..%2fetc%2fpasswd`, `..\\..\\`,
+    URL-encoding, double encoding, Unicode normalization), auth boundary
+    variants (different roles, empty tokens), injection variants (blind,
+    alternate injection points).
+  </Tab>
+</Tabs>
+
+Each variant is written to `workspace/reproducers/reattack_variant_<uuid>_<N>.py`
+and its result is recorded in `reattack_variants`:
+
+```json
+"reattack_variants": [
+  { "description": "off-by-one: len=bound+1", "triggered": false },
+  { "description": "alternate path via /api/v2/echo", "triggered": false },
+  { "description": "boundary mutation: max INT_MAX", "triggered": false }
+]
+```
+
+<Note>
+  A variant counts as a bypass (`triggered: true`) **only** if it reproduces
+  the **original vulnerability class** (same sink function / sanitizer signature
+  / crash type) through the public API. Unrelated crashes from junk mutants are
+  recorded as `triggered: false`.
+</Note>
+
+**Verdict rules:**
+
+- `reattack_status = "failed_to_bypass"` requires a non-empty `reattack_variants`
+  array with **≥ 3 valid variant inputs** that all failed. An empty or short set
+  caps at `VERIFICATION_INCOMPLETE`.
+- If ANY valid variant triggers the bug → `reattack_status = "bypassed_patch"`
+  and `patch_status` is atomically downgraded from `VERIFIED_SECURE` to
+  `VERIFICATION_FAILED`.
+
+## Snapshot-Mismatch C5 Baseline Re-Run
+
+When `reattack_snapshot_id != repro_snapshot_id` (a genuine snapshot change),
+the skill runs the **C5 unpatched-baseline re-run** before testing the patch:
+
+1. Run the reproducer against a fresh **unpatched** copy of the current snapshot.
+2. If the unpatched baseline does **not** trigger → set
+   `reattack_status = "inconclusive_baseline_changed"`. Do not claim
+   `failed_to_bypass`.
+3. If the unpatched baseline **does** trigger → proceed with the attack against
+   the patched build.
+
+## Sanitizer Guidance
+
+For C/C++ memory-safety targets, compile with `-fsanitize=address,undefined`
+(ASan + UBSan) at minimum. For data races, use `-fsanitize=thread` (TSan,
+which is mutually exclusive with ASan). Add `-fno-omit-frame-pointer` for
+readable stack traces.
+
+The **same sanitizer flags must be used for the baseline, attack, and re-attack
+runs** — a different sanitizer between runs can mask a bug and produce a false
+`VERIFIED_SECURE`.
+
+<Note>
+  UBSan runs in recover-mode by default (exit code 0). Scan stdout/stderr for
+  `runtime error:` and `SUMMARY: UndefinedBehaviorSanitizer` regardless of exit
+  code — a UBSan exit-0 run can still be a valid crash proof.
+</Note>
+
+## Output Fields Written to Finding
+
+**Normal run fields:**
+
+| Field | Description |
+|-------|-------------|
+| `repro_status` | Outcome: `reproduced`, `statically_confirmed`, `not_attempted`, `failed_to_reproduce` |
+| `repro_file_path` | Path to the generated PoC file |
+| `run_command` | Exact command to execute the PoC (uses `{TARGET_ROOT}` token) |
+| `repro_output` | Combined stdout/stderr from the sandbox run |
+| `repro_snapshot_id` | SNAPSHOT_ID this run executed against |
+| `repro_hints` | Compilation/sandbox telemetry: `sanitizers_used`, `assertions_disabled`, `build_profile` |
+
+**Re-attack fields (never overwrites normal fields):**
+
+| Field | Description |
+|-------|-------------|
+| `reattack_status` | `bypassed_patch`, `failed_to_bypass`, or `inconclusive_baseline_changed` |
+| `reattack_file_path` | Path to the re-attack script |
+| `reattack_run_command` | Exact re-attack execution command |
+| `reattack_output` | Combined stdout/stderr from the re-attack |
+| `reattack_variants` | Array of `{description, triggered}` objects (≥ 3 required for `failed_to_bypass`) |
+| `reattack_snapshot_id` | SNAPSHOT_ID the re-attack executed against |

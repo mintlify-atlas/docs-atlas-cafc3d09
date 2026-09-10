@@ -1,0 +1,267 @@
+---
+title: "/mantis-chain: Multi-Step Exploit Chain Builder"
+sidebarTitle: "/mantis-chain"
+description: "Combine individually validated low-severity findings into high-impact multi-step exploit chains, creating Super Finding records with a constituent_findings UUID array."
+---
+
+Individually, a path traversal that writes only to `/tmp` or a stored XSS with
+no CSRF protection may seem low severity. Together, they can form a full
+account-takeover chain. `/mantis-chain` analyzes validated findings and the
+knowledge base in concert, asking whether the postcondition of one finding
+satisfies the precondition of another, and constructs **Super Findings** — new
+exploit chain records that document the combined, escalated impact. Original
+constituent findings are left untouched: they still need to be patched
+individually. Use `/mantis-chain` after validation stages
+(`/mantis-review`, `/mantis-critic`) when you want to surface compound
+attack paths. Do not use it for initial codebase auditing or for writing
+patch code.
+
+## Command
+
+```
+/mantis-chain [--snapshot_root=<path>] [--snapshot_id=<id>]
+              [--state_root=<path>] [--target_root=<path>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  The pinned, immutable code snapshot root for this pass. Consumed by the
+  Block A locator resolution.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The snapshot identity string for this pass. Used by Block A (sentinel) and
+  Block B (match check for constituent eligibility).
+</ParamField>
+
+<ParamField path="--state_root" type="string" default=".">
+  Parent directory of `workspace/`. All `workspace/...` paths resolve relative
+  to this root.
+</ParamField>
+
+<ParamField path="--target_root" type="string" optional>
+  An already-prepared tree that overrides the snapshot root (Block A step 1a).
+  Rarely used by this stage.
+</ParamField>
+
+## Input / Output Contract
+
+<Tabs>
+  <Tab title="Reads">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/*.json` | Validated findings (status `VALID`, viability `VIABLE`, `CONDITIONAL_VIABLE`, or `SAMPLE_OR_TEST`) |
+    | `workspace/kb/entities/*.md` | Knowledge base primitives (architectural stepping stones) |
+    | `workspace/kb/vulnerabilities/*.md` | Known vulnerability patterns |
+    | `workspace/.mantis_state.json` | Current `pass_number` and `active_snapshot` |
+  </Tab>
+  <Tab title="Writes">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/<new_uuid>.json` | Net-new exploit chain finding JSON |
+  </Tab>
+</Tabs>
+
+<Note>
+  Original constituent findings are **never modified**. The chain is a
+  separate, net-new finding file with its own UUID. Both the chain and its
+  constituents will go through `/mantis-patch` independently.
+</Note>
+
+## Usage
+
+```
+/mantis-chain
+```
+
+Invoke without arguments (MODE-OFF). The skill reads validated findings,
+consults the knowledge base, identifies viable exploit chains, and writes
+chain finding JSON files.
+
+**With a pinned snapshot:**
+
+```
+/mantis-chain \
+  --snapshot_root=/tmp/mantis_snapshots/pass_3 \
+  --snapshot_id=abc123def456 \
+  --state_root=/workspace
+```
+
+## How Chains Are Constructed
+
+<Steps>
+  <Step title="Load Primitives and Filter Eligible Constituents">
+    Read all findings passing the validation/viability filter. In PINNED mode,
+    run the **Block B Snapshot Match Check** on each candidate — only findings
+    whose `discovery_commit` exactly equals the current `SNAPSHOT_ID` are
+    eligible links. Findings with missing, empty, `"MIXED"`, or mismatched
+    `discovery_commit` are excluded as potential links.
+
+    Also read the Markdown knowledge base (`workspace/kb/entities/`,
+    `workspace/kb/vulnerabilities/`) to identify architectural primitives that
+    are not bugs on their own but could serve as stepping stones (e.g., "User
+    controls file upload path", "Service runs as root").
+
+    **Minimum eligibility guard:** If fewer than 2 eligible constituents remain
+    after filtering, no chain is built. Log "no chain: fewer than 2
+    snapshot-matched constituents" and stop.
+  </Step>
+  <Step title="Cross-Finding Analysis — The Chaining Matrix">
+    For each pair (or multi-step sequence) of eligible findings, ask:
+    *Can the output or side-effect of Finding A satisfy the strict precondition
+    required to trigger Finding B?*
+
+    Example chain patterns to look for:
+
+    - **Path Traversal + Loose Permissions → RCE:** a low-severity path
+      traversal writes to `/tmp`; a separate misconfiguration lets a cron job
+      execute scripts in `/tmp`.
+    - **XSS + CSRF → Account Takeover:** stored XSS harvests an anti-CSRF token
+      to execute a state-changing action.
+    - **Info Leak + Buffer Overflow → ASLR Bypass:** a memory-address reveal
+      satisfies the precondition for a reliable stack overflow exploit.
+  </Step>
+  <Step title="Construct Super Findings">
+    For each viable chain, generate a net-new UUID and create
+    `workspace/findings/<new_uuid>.json`. The chain schema requires:
+
+    - `constituent_findings` array of UUID strings
+    - `code_paths` copied verbatim from constituents (already snapshot-relative)
+    - `privileges_required` from the **entry point** constituent (lowest
+      privilege needed to start the chain)
+    - `attacker_position` inherited from the **entry point** constituent
+    - `user_interaction` set to `REQUIRED` if any step in the chain requires it
+    - `status` set to `"VALID"`
+    - `repro_status` set to `"statically_confirmed"` (if all constituents are
+      `reproduced`/`statically_confirmed`) or `"not_attempted"` (if any
+      constituent has a `failed_to_reproduce` or `not_attempted` status)
+
+    Production viability propagates from constituents: any `SAMPLE_OR_TEST`
+    constituent forces `SAMPLE_OR_TEST`; any `CONDITIONAL_VIABLE` forces
+    `CONDITIONAL_VIABLE`; otherwise `VIABLE`.
+  </Step>
+</Steps>
+
+## The `constituent_findings` Array
+
+The `constituent_findings` field in a chain finding's JSON is the canonical
+record of which individual findings make up the chain. Each entry is a
+UUIDv4 string referencing an existing finding file:
+
+```json
+{
+  "id": "<new-chain-uuid>",
+  "title": "Exploit Chain: Remote Code Execution via Path Traversal and Cron Execution",
+  "constituent_findings": [
+    "550e8400-e29b-41d4-a716-446655440001",
+    "550e8400-e29b-41d4-a716-446655440002"
+  ],
+  "status": "VALID",
+  "production_viability": "VIABLE",
+  "repro_status": "statically_confirmed",
+  "severity": "CRITICAL",
+  "privileges_required": "NONE",
+  "attacker_position": "EXTERNAL",
+  "user_interaction": "NONE"
+}
+```
+
+<Note>
+  `/mantis-patch` reads `constituent_findings` to resolve and monitor the patch
+  status of each individual link before computing the chain's aggregate
+  `patch_status`. An exploit chain is only considered `VERIFIED_SECURE` when
+  **all** constituent findings are independently verified.
+</Note>
+
+## Signature and Lineage Computation
+
+Each chain finding gets a deterministic `signature` and a `lineage_id`:
+
+<Tabs>
+  <Tab title="signature">
+    If every eligible constituent has a non-empty `signature`, the chain
+    signature is computed as:
+
+    ```
+    first_16_hex_chars(sha256("chain|" + "|".join(sorted(constituent_signatures))))
+    ```
+
+    The `"chain|"` prefix prevents collisions with non-chain finding signatures.
+    Sorting makes the chain signature invariant to constituent re-ordering.
+
+    If any constituent lacks a `signature` field (legacy finding), the chain's
+    `signature` is the **empty string** (omitted from the JSON). Downstream
+    consumers fall back to UUID-based dedupe behavior.
+  </Tab>
+  <Tab title="lineage_id">
+    The skill scans `workspace/archive/findings_pass_*/` and legacy
+    `workspace/archive/loop*_findings/` for any archived chain finding whose
+    `signature` exactly equals this chain's computed signature. If found, the
+    `lineage_id` is inherited from the most recent (highest pass number)
+    matching ancestor — enabling report folding across passes. If no match
+    is found, a fresh UUIDv4 is minted.
+  </Tab>
+  <Tab title="discovery_commit">
+    - **MODE-OFF** (no `active_snapshot`): the field is **omitted entirely**.
+    - All eligible constituents share the same `discovery_commit`: the chain
+      inherits that exact string.
+    - Constituents have differing or missing `discovery_commit` values: set to
+      the literal `"MIXED"` (causes Block B → NOT_MATCHED for the chain, the
+      safe branch).
+  </Tab>
+</Tabs>
+
+## Idempotency
+
+Before minting a new chain UUID, the skill scans `workspace/findings/` **and**
+every archive directory for an existing chain with the same constituent
+sequence:
+
+- **All constituents have `signature`** — compare ordered `signature` sequences
+  AND require a per-constituent line-inclusive `code_paths` tiebreak. A
+  signature-sequence match alone is insufficient (two distinct bugs in the same
+  file can share a signature).
+- **Any constituent lacks `signature`** — fall back to comparing ordered
+  constituent UUID sequences (legacy behavior).
+
+If a matching chain already exists in either location, the new chain is skipped
+entirely.
+
+<Warning>
+  In HALT mode (`active_snapshot` present but `snapshot_pinned = false`), no
+  chains are built at all. Findings' locators and pre/post-conditions may be
+  stale when the tree could not be pinned, so no authoritative chain verdicts
+  can be produced.
+</Warning>
+
+## Chain Finding Schema
+
+```json
+{
+  "id": "<uuid>",
+  "title": "Exploit Chain: [Impact] via [Finding A] and [Finding B]",
+  "description": "Step-by-step documentation. Step 1: trigger Finding A. Step 2: use its output to satisfy the precondition for Finding B.",
+  "impact": "Combined escalated impact (e.g., Remote Code Execution)",
+  "severity": "CRITICAL",
+  "privileges_required": "NONE | LOW | HIGH",
+  "user_interaction": "NONE | REQUIRED",
+  "attacker_position": "EXTERNAL | LOCAL | ...",
+  "code_paths": ["relative/path_A.c:line", "relative/path_B.c:line"],
+  "mitigation": "Fix at least one link in the chain; recommended to fix all.",
+  "status": "VALID",
+  "production_viability": "VIABLE | SAMPLE_OR_TEST | CONDITIONAL_VIABLE",
+  "repro_status": "statically_confirmed | not_attempted",
+  "constituent_findings": ["UUID_A", "UUID_B"],
+  "signature": "<16-hex-char sha256 prefix, or empty string>",
+  "lineage_id": "<inherited or fresh UUIDv4>",
+  "discovery_commit": "<shared SNAPSHOT_ID, MIXED, or absent>",
+  "history": [
+    {
+      "stage": "chainer",
+      "action": "created",
+      "details": "Constructed by chaining findings UUID_A and UUID_B.",
+      "pass_number": 1,
+      "timestamp": "2026-07-14T15:13:00Z"
+    }
+  ]
+}
+```

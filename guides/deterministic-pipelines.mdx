@@ -1,0 +1,100 @@
+---
+title: "Build Deterministic Pipelines Wrapping Mantis"
+sidebarTitle: "Deterministic Pipelines"
+description: "Learn why and how to build a programmatic harness around Mantis skills for CI/CD integration, prompt-injection resistance, and horizontal scale."
+---
+
+While the interactive CLI workflow is ideal for exploratory research, production security operations benefit from wrapping the Mantis skills inside a **deterministic programmatic pipeline**. A harness you control gives you stronger reliability guarantees, resistance to prompt injection, enforced sandboxing, and the ability to integrate Mantis into standard CI/CD systems. The individual skills become microservices; your harness becomes the orchestrator.
+
+## Why Build a Harness?
+
+Running skills directly from the CLI works well for getting started, but introduces risks and limitations at scale. A deterministic harness addresses each of these systematically.
+
+<CardGroup cols={2}>
+  <Card title="Determinism" icon="repeat">
+    Stages like `/mantis-reproduce` and `/mantis-patch` include subagent critic steps the LLM could forget to call. A harness enforces each gate programmatically so no step is silently skipped.
+  </Card>
+  <Card title="Prompt Injection Resistance" icon="shield-halved">
+    An LLM orchestrating shell commands is susceptible to host-level prompt injection if it ingests malicious code. Moving orchestration to a hardened program removes the LLM's control over the host environment.
+  </Card>
+  <Card title="Enforced Sandboxing" icon="box">
+    Rather than relying on the LLM to remember `--network none`, your harness can programmatically guarantee that every generated payload executes exclusively inside a locked-down container or VM.
+  </Card>
+  <Card title="CI/CD Integration" icon="gear">
+    A deterministic script running the static analysis and deduplication stages is predictable and fits naturally into GitHub Actions, Jenkins, or any other pipeline system.
+  </Card>
+  <Card title="Horizontal Scale" icon="server">
+    The pipeline can be decomposed into independent pieces, allowing you to run multiple researcher or patcher instances across a fleet during periods of low utilization.
+  </Card>
+  <Card title="Deterministic Reporting" icon="file-lines">
+    A harness can translate `workspace/findings/*.json` into Markdown reports or file them into bug trackers without risking LLM hallucination or state corruption in the reporting path.
+  </Card>
+</CardGroup>
+
+## Skills as Microservices
+
+Each Mantis skill reads its inputs from and writes its outputs to the shared `workspace/` directory on disk. This makes the skills composable microservices that communicate through a well-defined JSON state contract.
+
+The canonical inter-stage contract is defined in [`schema.json`](https://github.com/google/mantis/blob/main/schema.json). Before building any harness, read and strictly adhere to the schemas defined there. The key directories and files your harness will interact with are:
+
+| Path | Owner | Description |
+|------|-------|-------------|
+| `workspace/findings/*.json` | All stages | Per-finding JSON records — the primary inter-stage state |
+| `workspace/plan.json` | `/mantis-plan` | Scanning roadmap with `kb_references` pointers |
+| `workspace/kb/` | `/mantis-architecture` | Markdown Knowledge Base — entities, data flows, vulnerability classes |
+| `workspace/learnings.jsonl` | `/mantis-reflect`, `/mantis-critic`, `/mantis-patch` | Structured insight inbox |
+| `workspace/historical_learnings.jsonl` | `/mantis-history` | VCS-extracted past vulnerability patterns |
+| `workspace/report/review_packet-latest.md` | `/mantis-report` | Human-readable final report |
+
+<Note>
+  For production deployments, replace the flat JSON files with durable databases. The `workspace/findings/` approach works for single-machine runs but does not provide the resilience of a proper data store across failures or distributed execution.
+</Note>
+
+## The Hybrid Approach
+
+The most practical path for teams adopting Mantis at scale is a **hybrid approach**: keep the adaptive AI-driven analysis while adding deterministic orchestration rails around the risky stages.
+
+<Steps>
+  <Step title="Iterate Programmatically">
+    Your harness loops over the workspace, invoking the static and planning skills via CLI. The loop calls `/mantis-architecture`, `/mantis-plan`, `/mantis-researcher`, `/mantis-dedupe`, `/mantis-review`, and `/mantis-critic` in sequence, reading their JSON outputs at each step.
+  </Step>
+  <Step title="Feed Learnings Back Through /mantis-plan">
+    After each iteration, your harness takes the resulting `workspace/learnings.jsonl` and invokes `/mantis-plan` to generate an updated `workspace/plan.json`. This allows the AI to guide the deterministic runner on what to analyze next while keeping orchestration control with your code.
+  </Step>
+  <Step title="Hardcode the Execution Sandbox">
+    Configure `/mantis-reproduce` and `/mantis-patch` to only generate the script or patch file, then have your harness execute and grade the output in a strictly controlled sandbox. This separates file generation (which the LLM controls) from execution (which your harness controls).
+  </Step>
+  <Step title="Deterministic Reporting">
+    Your harness reads the final `workspace/findings/*.json` files and produces reports or files bugs using deterministic code, not an LLM. Only use an LLM for bounded subsets like generating an executive summary.
+  </Step>
+</Steps>
+
+## Choosing a Harness Language
+
+The harness can be written in any language your team is comfortable with. Python and Bash are common choices. **Rust** is another option some teams have found effective for complex orchestrations, due to its type and memory safety, detailed compiler error messages that LLMs can use to iteratively fix generated code, and native performance. That said, success rates with AI-generated Rust vary significantly based on task complexity, prompt design, and model class — use the language that makes your team most productive.
+
+<Tip>
+  Regardless of language, the harness must treat `schema.json` as its API contract. Any field your harness writes to a `workspace/findings/*.json` file must conform to the schema. Any field it reads must handle absent/null values gracefully by falling back to the safe branch as documented in `schema.json`.
+</Tip>
+
+## Getting Started with the Pipeline Adapter
+
+The `/mantis-pipeline-adapter` skill (`mantis-pipeline-adapter/SKILL.md`) is a dedicated starting point for designing custom pipelines. It covers:
+
+- **High reliability patterns** — deterministic stage gating, UUID-based finding references, retry logic
+- **Token efficiency** — techniques for reducing context window usage across long runs
+- **SAST seeding** — ingesting findings from external tools (CodeQL, Semgrep) as `PROVISIONALLY_VALID` candidates that must pass unchanged downstream gates (Guideline 8 in the adapter guide)
+- **MCP integration** — adapting to custom environments via Model Context Protocol
+- **Colocated-state hazard** — avoiding the `--state_root` pitfall when the workspace lives inside the target repo
+
+<Info>
+  The SAST seeding adapter uses a platform-agnostic JSONL IR format (not SARIF) that any SAST tool can convert to. External findings enter the pipeline as `PROVISIONALLY_VALID / NEEDS_RESEARCH` and must earn their verdict through the unchanged downstream gates — no existing skills are modified.
+</Info>
+
+## Overriding State Management in a Harness
+
+When running Mantis skills from the CLI in standalone mode, skills like `/mantis-review` and `/mantis-patch` instruct the LLM to write temporary Python scripts to update JSON state files. In a true programmatic harness you should override these instructions and provide native tool calls or functions for state management. This avoids forcing the LLM to write one-off update scripts and gives your harness precise control over every state transition.
+
+## The ADK Reference Implementation
+
+The `reference/` directory contains a production-grade harness built on the Google Agent Development Kit (ADK) that demonstrates all of these patterns. It compiles 16 sequential agent nodes into native ADK constructs, enforces the inter-stage JSON contract, supports pluggable sandbox environments, and provides a layered configuration system with `workflow.json` and `workflow.local.json`. See [Set Up the ADK Reference Implementation](/configuration/reference-implementation) for full setup details.

@@ -1,0 +1,147 @@
+---
+title: "/mantis-plan: Targeted Security Review Strategist"
+sidebarTitle: "/mantis-plan"
+description: "Analyzes the threat model, KB, and VCS diffs to produce a targeted workspace/plan.json roadmap of investigations for the researcher to execute."
+---
+
+The `/mantis-plan` skill reads the Knowledge Base and active threat model to produce `workspace/plan.json` — a structured roadmap of targeted investigations for `/mantis-researcher` to execute. On first pass (Mode A) it performs an exhaustive codebase crawl. On subsequent passes (Mode B) it uses accumulated KB knowledge to drive strategic deep dives, retry eligible archived findings, and schedule coverage for changed files. Run it when starting a security review campaign after the KB is populated. Do not use it for executing code reviews, writing test scripts, or patching code.
+
+## Command
+
+```
+/mantis-plan [--snapshot_root <dir>] [--snapshot_id <id>]
+             [--state_root <dir>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Absolute path to the pinned, read-only code snapshot (`CODE_ROOT`). Mode A crawls source files from this directory.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The pass snapshot identifier. Used for the sentinel check and Block B snapshot-match decisions.
+</ParamField>
+
+<ParamField path="--state_root" type="string" optional>
+  Parent directory of `workspace/`. `plan.json`, `.mantis_state.json`, `findings/`, `kb/`, and `archive/` are all read and written STATE-RELATIVE — never under `CODE_ROOT`. When absent, defaults to `./workspace/` (MODE-OFF / legacy behavior).
+</ParamField>
+
+<Note>
+  **All flags absent → MODE-OFF.** The skill behaves exactly as today — reads source from the current directory, writes `workspace/plan.json`, and applies the MODE-OFF bypass rules for finding retries.
+</Note>
+
+## Input / Output Contract
+
+### Reads
+
+| Path | Purpose |
+|------|---------|
+| `workspace/.mantis_state.json` | Pass number, `active_snapshot`, `snapshot_history`, `changed_files` |
+| `workspace/kb/THREAT_MODEL.md` | Threat actors, trust boundaries, and high-risk assets |
+| `workspace/kb/index.md` | Determines Mode A vs Mode B |
+| `workspace/kb/dependencies.json` | Dependency fan-out for changed-file investigations |
+| `workspace/kb/structural_index/manifest.json` | Structural index availability |
+| `workspace/helpers/query_structural_index.py` | Bounded structural index queries |
+| `workspace/archive/.repro_attempts.json` | Reproduction attempt budget per finding |
+| `CODE_ROOT` production directories and `mantis-summary.md` files | Mode A codebase crawl |
+
+### Writes
+
+| Path | Content |
+|------|---------|
+| `workspace/plan.json` | Structured investigation roadmap |
+| `workspace/findings/<uuid>.json` | Verbatim copies of retry-eligible archived findings (snapshot-matched only) |
+
+## Plan Schema
+
+```json
+{
+  "investigations": [
+    {
+      "title": "Exhaustive Review: relative/file/path.c",
+      "target_files": ["relative/file/path.c", "relative/other/path.c"],
+      "kb_references": [
+        "workspace/kb/entities/auth_module.md",
+        "workspace/kb/vulnerabilities/CWE-79.md"
+      ],
+      "question": "Detailed reviewing prompt instructing the researcher to trace specific input pathways, variables, memory allocations, or function constraints."
+    }
+  ]
+}
+```
+
+## Usage
+
+### Standalone invocation (MODE-OFF)
+
+```bash
+/mantis-plan
+```
+
+### With snapshot and state root (orchestrated)
+
+```bash
+/mantis-plan \
+  --snapshot_root /tmp/mantis/snapshots/snap_abc \
+  --snapshot_id snap_abc \
+  --state_root /tmp/mantis/state
+```
+
+## Notes
+
+<Accordion title="Mode A vs Mode B">
+  The skill selects its operating mode by checking for `workspace/kb/index.md`:
+
+  **Mode A — First-Pass Exhaustive Mode (no `kb/index.md`):**
+  Guarantees complete codebase coverage. A generated script uses `find`/`os.walk` to crawl all production directories, reads `mantis-summary.md` files when present (to avoid ingesting raw source files), and writes `workspace/plan.json` directly. Uses a generic baseline question per investigation. Ignores test folders, build artifacts, and vendor dependencies.
+
+  **Mode B — Strategic Learning Mode (`kb/index.md` exists):**
+  Reads `kb/index.md` and `THREAT_MODEL.md` to drive targeted deep dives and regression reviews for components with histories of vulnerabilities. Plan JSON may be written directly using file-writing tools rather than a generated script, since the scope is narrower.
+</Accordion>
+
+<Accordion title="Changed-file coverage (MANDATORY in Mode B)">
+  The skill computes `changed_files` by running a VCS diff in the **live repository root** (not `CODE_ROOT`) between the previous snapshot and the current one:
+
+  ```bash
+  # Git
+  git diff --name-status -M -C --diff-filter=RAMDCT PREV CUR
+
+  # Mercurial
+  hg status -C --rev PREV:CUR
+  ```
+
+  An investigation titled `Exhaustive Review: <path>` is added for **every** path in `changed_files`. If `changed_files_status == UNKNOWN` and `active_snapshot` is present (a sync occurred), the plan falls back to a full Mode A crawl — even if `kb/index.md` exists — to catch newly added files.
+</Accordion>
+
+<Accordion title="Finding retry and re-discovery logic">
+  For each archived finding from prior passes, the skill applies a Block B snapshot match check:
+
+  - **MATCHED** (pinned + `discovery_commit == SNAPSHOT_ID` + file unchanged + file exists under `CODE_ROOT`): finding is **copied verbatim** back to `workspace/findings/<uuid>.json` for fast retry.
+  - **NOT_MATCHED** (any condition fails): the finding is **re-discovered** — a fresh investigation is appended to `plan.json` embedding the finding's `title`, `description`, and `repro_hints`, plus a repo-wide symbol/keyword search for moved/renamed bugs.
+
+  Terminal findings (`FALSE_POSITIVE`, `VERIFIED_SECURE`, `reproduced`) are **not** retried unless their file appears in `changed_files` — in which case they are re-discovered as a possible regression.
+
+  **Attempt budget:** The `.repro_attempts.json` cache tracks attempts per finding. Findings at or above the 2-attempt cap for the current snapshot are not retried.
+</Accordion>
+
+<Accordion title="Dependency-aware fan-out">
+  When `changed_files_status` is known and `workspace/kb/dependencies.json` is available, the plan expands investigation scope beyond just the changed files:
+
+  1. For each changed file F, find all files that import F (up to 2 hops) using `dependencies.json`.
+  2. Use the structural index query helper (`resolve_symbol` + `find_callers`) for symbol-level caller discovery on top of the dependency graph.
+  3. Schedule `Exhaustive Review: <dependent_file>` entries for the **union** of both result sets.
+
+  The dependency graph decides **addition** to the scope, never removal. If the KB is stale or the dependency graph is incomplete, the skill falls back to a full Mode A crawl.
+</Accordion>
+
+<Accordion title="Exploratory investigations">
+  With a 25–50% probability per planning pass, the skill also includes one of:
+
+  - **Adversarial Sweep:** A component the threat model currently marks as safe or out of scope, instructing the researcher to ignore safety assumptions.
+  - **Random Digging:** An open-ended exploration of a randomly chosen file or directory, with `kb_references` set to an empty list for a fresh look unbiased by prior KB context.
+
+  These are intentional noise injections to discover issues that purely directed audits miss.
+</Accordion>
+
+<Accordion title="Context injection via kb_references">
+  For every investigation, the planner determines which KB files provide relevant security context (e.g., an entity file for the component being audited, or a vulnerability class file for a known bug pattern). These are listed in the `kb_references` array so the researcher loads them before auditing — eliminating redundant KB lookups per investigation.
+</Accordion>

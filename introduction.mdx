@@ -1,0 +1,97 @@
+---
+title: "Mantis: Autonomous AI Security Review Toolkit"
+sidebarTitle: "Introduction"
+description: "Mantis is a modular, stack-agnostic toolkit of security review skills for AI coding agents to autonomously find, reproduce, and patch vulnerabilities."
+---
+
+Mantis is an open-source Google project that equips AI coding agents with a sequential suite of security review skills. Rather than a monolithic scanner, it is a decoupled pipeline of 16 composable stages — from VCS history extraction through knowledge-base synthesis, deep vulnerability research, proof-of-concept reproduction, automated patching, and final reporting — all coordinated through shared on-disk state. Because Mantis is platform-agnostic, you can drive the same skills from Gemini CLI, Antigravity CLI, the Google Agent Development Kit (ADK), or any coding-agent framework that supports slash commands.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first Mantis security review in five steps — from installing Docker to reading the final report.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the 16-stage pipeline, inter-stage data contracts, and the snapshot model for continuous reviews.
+  </Card>
+</CardGroup>
+
+## What Mantis Does
+
+Mantis orchestrates a full security review workflow inside the directory you open your coding agent in. Each stage is defined by a `SKILL.md` file that instructs the agent precisely what to analyze, what files to read and write, and how to hand off to the next stage. Stages communicate exclusively through a shared `workspace/` directory, making it straightforward to swap out individual stages, add custom ones, or wrap the entire sequence in a deterministic programmatic harness.
+
+The pipeline covers:
+
+- **Context building** — extracting VCS history, generating per-directory summaries, and synthesizing an interlinked Markdown Knowledge Base (`workspace/kb/`)
+- **Threat modeling** — deriving a living `THREAT_MODEL.md` from the KB, mapping trust boundaries and attacker profiles
+- **Vulnerability research** — file-by-file security sweeps producing structured JSON findings in `workspace/findings/`
+- **Validation and deduplication** — filtering false positives with negative rules, merging duplicates, and verifying production viability
+- **Reproduction** — writing proof-of-concept scripts and running them in isolated sandboxes (gVisor, MicroVM, GCE, or static-only)
+- **Exploit chaining** — identifying multi-step attack paths from individual findings
+- **Patching** — generating minimal code fixes and re-attacking the patched surface to confirm remediation
+- **Risk calibration and reporting** — scoring findings 1–10 and compiling a human-readable security review packet
+
+## Platform Agnosticism
+
+Mantis does not prescribe which agent runtime you use. The same `SKILL.md` definitions work with any tool that supports slash commands and a working directory. The project has been used successfully with:
+
+- **Gemini CLI** — Google's conversational coding agent
+- **Antigravity CLI** — an alternative agentic framework
+- **Google ADK** — the Agent Development Kit, for which a production-grade reference harness is included in the `reference/` directory of the repository
+
+You can also adapt Mantis to specialized domains beyond generic web/cloud code reviews: Hardware/RTL designs, Infrastructure-as-Code, ML pipelines, and compiled firmware gray-box audits are all supported use cases documented in the Agent Reference Guide.
+
+## The 16-Skill Pipeline at a Glance
+
+The full pipeline runs sequentially, with each skill writing output that the next skill reads. Optional stages are marked clearly.
+
+| # | Skill | Role |
+|---|-------|------|
+| 0 | `/mantis-history` | Extract past vulnerabilities from VCS history *(optional)* |
+| 0.5 | `/mantis-structural-index` | Build content-addressed semantic-unit index *(optional)* |
+| 1 | `/mantis-summarize` | Generate per-directory summary maps *(optional)* |
+| 2 | `/mantis-architecture` | Synthesize codebase into Markdown Knowledge Base |
+| 3 | `/mantis-threat-model` | Develop a living threat model from the KB |
+| 4 | `/mantis-plan` | Build a targeted scanning roadmap |
+| 5 | `/mantis-researcher` | Run the security flaw sweep |
+| 6 | `/mantis-dedupe` | Consolidate duplicate findings |
+| 7 | `/mantis-review` | Filter false positives |
+| 8 | `/mantis-critic` | Eliminate non-viable production issues |
+| 9 | `/mantis-reproduce` | Generate and run proof-of-concept crash reproducers |
+| 10 | `/mantis-chain` | Construct multi-step exploit chains |
+| 11 | `/mantis-patch` | Apply and verify minimal code fixes |
+| 12 | `/mantis-calibrate` | Calculate final Mantis Risk Scores (1–10) |
+| 13 | `/mantis-reflect` | Extract learnings from execution trajectories |
+| 14 | `/mantis-report` | Produce the human-readable security review packet |
+
+## When to Use Mantis
+
+Mantis is well-suited for security teams and developers who want to:
+
+- Perform a structured, repeatable security review of a codebase before a release
+- Continuously monitor a living codebase for newly introduced vulnerabilities (via the opt-in snapshot model)
+- Augment or seed findings from existing SAST tools (CodeQL, Semgrep) with AI-driven deep reasoning
+- Explore specialized attack surfaces such as RTL designs, Kubernetes RBAC configurations, or firmware binaries
+
+It is **not** a drop-in replacement for human security review. The pipeline is a starting point that you should adapt, tune, and extend for your organization's specific stack and risk tolerance.
+
+## Responsible Use
+
+<Warning>
+  **USE AT YOUR OWN RISK.** Mantis is designed to generate and execute autonomously generated code that may perform unexpected actions. **Only run Mantis inside isolated, restricted environments.** Never run it on a machine with access to production systems, sensitive data, or internal networks.
+</Warning>
+
+<Warning>
+  **Never use `--yolo` or `--dangerously-skip-permissions`** (or any auto-approval flag) unless you have fully implemented the hardened security boundaries described in the Installation and Cloud Deployment guides. These flags remove the human-in-the-loop confirmation step that protects your host from AI-generated payloads.
+</Warning>
+
+<Note>
+  **AI models are non-deterministic and can hallucinate findings or generate incorrect patches.** All findings must be manually verified by a qualified security expert before being reported or acted upon. A failure to automatically reproduce a vulnerability does not definitively mean it is a false positive, nor does a successful reproducer guarantee the bug is exploitable in all contexts.
+</Note>
+
+<Note>
+  Do not mass-file unverified, AI-generated vulnerability reports to open-source maintainers. Use these skills responsibly. For more information on securing AI systems, see Google's [Secure AI Framework (SAIF)](https://safety.google/safety/saif/).
+</Note>
+
+<Info>
+  This is not an officially supported Google product and is not eligible for the Google Open Source Software Vulnerability Rewards Program. It is intended for demonstration purposes and is not designed for direct use in production environments.
+</Info>

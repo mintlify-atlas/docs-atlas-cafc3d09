@@ -1,0 +1,154 @@
+---
+title: "Evaluate and Optimize Mantis Skill Performance"
+sidebarTitle: "Evaluations"
+description: "Use a three-tier evaluation strategy, proxy metrics, and the Shadow Eval method to safely tune Mantis skills without burning excessive tokens."
+---
+
+Evaluating an autonomous, multi-agent pipeline like Mantis is notoriously difficult. Running full end-to-end evaluations for every prompt tweak is cost-prohibitive in both time and API tokens. Skill prompts interact with model behavior in non-obvious ways, and a change that improves one stage can silently degrade another. The approach described here — a tiered evaluation strategy anchored by real-world failures — lets you make safe, measurable improvements without spinning up the entire pipeline on every iteration.
+
+## The Tiered Evaluation Strategy
+
+Do not evaluate the entire pipeline loop unless necessary. Split your evaluations into three tiers that differ in scope, cost, and when to use them:
+
+<Steps>
+  <Step title="Tier 1: Static Checks">
+    **What it is:** Fast, programmatic linting of the skill files. These checks run in milliseconds and catch structural problems before any LLM call is made.
+
+    **What to measure:**
+    - Do the `SKILL.md` files parse correctly?
+    - Are the YAML frontmatters well-formed and complete?
+    - Do the skill definitions include the required tool definitions?
+    - Are the system prompts within the context window limits of your target model?
+
+    Run these checks automatically on every commit that modifies a `SKILL.md` file. A failed static check should block the change before it ever reaches a live agent.
+  </Step>
+  <Step title="Tier 2: Isolated Unit Evals">
+    **What it is:** Evaluating a single skill in a vacuum, entirely decoupled from the rest of the pipeline. This is your primary tool for safe, incremental skill improvement.
+
+    **The setup:** Feed a static, hardcoded input to a single skill and observe its output. For example, to evaluate `/mantis-patch`, provide a mocked `findings.json` containing a known vulnerability and a target file with the vulnerable code. Observe what the agent produces.
+
+    **What to measure:**
+    - **Format correctness:** Did the skill output the expected JSON schema, or produce a valid unified diff?
+    - **Tool use:** Did the agent call the correct tools? (`run_command` vs. `view_file`, for example)
+    - **LLM-as-a-Judge:** Use a cheaper, faster model to grade the qualitative output against a strict rubric. For example: "Did the patch address the SQL injection without modifying unrelated code? Yes/No."
+
+    The ADK reference implementation includes ready-made unit eval datasets in `reference/evals/`:
+    - `synthetic_dataset.json` — deduplication eval with ground-truth clusters
+    - `review_dataset.json` — false positive / true positive classification cases
+    - `critic_dataset.json` — production viability assessment cases
+    - `calibrate_dataset.json` — risk scoring accuracy cases
+
+    Run the benchmark with `reference/evals/run_eval.py`:
+
+    ```bash
+    # Evaluate the dedupe stage across multiple model configurations
+    python reference/evals/run_eval.py --stage dedupe --runs 3
+
+    # Evaluate a specific model and effort level
+    python reference/evals/run_eval.py \
+      --stage review \
+      --model vertex_ai/gemini-3.5-flash \
+      --effort high \
+      --runs 5
+    ```
+
+    The benchmark outputs precision, recall, safety score, and latency distribution for each configuration, making it straightforward to compare a cheaper model against a frontier model for utility stages like deduplication and calibration.
+  </Step>
+  <Step title="Tier 3: Golden Dataset End-to-End Eval">
+    **What it is:** A full run of the entire pipeline from `/mantis-architecture` through `/mantis-report`. Only run this for major releases or when swapping base model classes (for example, upgrading to a newer flagship model generation).
+
+    **The setup:** Curate a small dataset of 3–5 real-world, representative vulnerable repositories. These should be repositories with known, verified vulnerabilities whose CVEs or public disclosures give you a ground truth to check against.
+
+    **What to measure:** Binary outcomes are the most reliable signal at this tier:
+    - Did the final `workspace/findings/` contain the known vulnerability?
+    - Did `/mantis-reproduce` generate a working proof-of-concept?
+    - Did `/mantis-patch` produce a fix that passes the re-attack verification?
+
+    You can also perform human evaluation for novel findings: did the pipeline discover vulnerabilities beyond the known ground truth, and are they credible?
+
+    <Warning>
+    Tier 3 evals are expensive. Do not run them on every prompt change. Reserve them for when you are confident a change is ready for promotion — after it has passed Tier 1 and Tier 2 checks.
+    </Warning>
+  </Step>
+</Steps>
+
+---
+
+## Proxy Metrics for Intermediate Stages
+
+For stages like `/mantis-researcher`, binary success is hard to define — there is no ground truth for "all vulnerabilities in this repository." Instead, track these proxy metrics to detect skill degradation after a change:
+
+<CardGroup cols={3}>
+  <Card title="Tool Error Rate" icon="triangle-exclamation">
+    Count how many times the agent's tool calls fail per session — bad bash syntax, invalid file paths, malformed JSON arguments. A spike in tool errors after a prompt change signals that the skill's instruction set has degraded or needs to be adapted for a new model or agent harness.
+  </Card>
+  <Card title="Trajectory Efficiency" icon="chart-line">
+    Track the number of turns and tokens consumed per successful outcome. If `/mantis-reproduce` used to write a working PoC in 5 turns and after a prompt change it takes 150 turns or enters a loop, that is a measurable regression — even if the final output looks correct.
+  </Card>
+  <Card title="The Give-Up Rate" icon="flag">
+    Count how often the agent explicitly outputs phrases like "I cannot determine", "I am stuck", or loops repeatedly before hitting a token limit. A rising give-up rate indicates the skill prompt is not giving the agent adequate grounding to make progress on your target codebase.
+  </Card>
+</CardGroup>
+
+---
+
+## The Shadow Eval Method
+
+Do not build a comprehensive evaluation harness before you have anything to evaluate. Build your dataset organically from real-world pipeline failures:
+
+<Steps>
+  <Step title="Wait for a real failure">
+    While running the pipeline manually on a real target, observe when an agent fails at a specific, reproducible task — for example, `/mantis-reproduce` loops on a particular vulnerability type, or `/mantis-review` consistently filters out a class of real findings as false positives.
+  </Step>
+  <Step title="Save the exact starting state">
+    Capture the precise context that led to the failure: the user prompt, the contents of `workspace/findings/` at that moment, the relevant target file, and the agent's output. This is your failing test case.
+  </Step>
+  <Step title="Fix the skill prompts against this case">
+    Modify the relevant `SKILL.md` until the agent succeeds on this specific input in isolation (Tier 2 eval). Do not modify anything else.
+  </Step>
+  <Step title="Promote the case to an automated test">
+    Add the captured state as a new test case in your eval dataset. This ensures you are testing against real failure modes, not hypothetical ones.
+  </Step>
+</Steps>
+
+By building your eval dataset exclusively from real-world failures, you ensure you are only spending tokens testing regressions that actually matter. A dataset built from real failures is also far more representative of your specific codebase and pipeline configuration than a synthetic one.
+
+---
+
+## Optimizing Parallelism and Model Selection
+
+When introducing features like parallel trajectory search, run experiments to confirm you are getting a return on your token investment before committing to the configuration.
+
+### Model Swapping
+
+For any given stage, experiment with swapping the frontier model for a cheaper, faster model or a specialized coding model. Use Tier 2 unit evals to verify whether the cheaper model degrades success rate before rolling it out:
+
+- **Utility stages** (dedupe, calibrate, reflect) are good candidates for flash/lite models. These tasks require rapid text parsing rather than deep reasoning.
+- **Deep reasoning stages** (reproduce, patch, chain) should retain frontier models. A cheaper model that takes twice as many turns to write a working PoC is not cheaper in practice.
+- **Research stages** benefit from running different model providers in parallel during the same sweep to increase coverage — different models have different blind spots.
+
+### Parallel Trajectories
+
+If you implement parallel trajectory search — spawning multiple concurrent Researcher or Patcher agents on the same finding — test different concurrency levels to find the point of diminishing returns:
+
+- **For parallel researchers:** If multiple agents consistently find the exact same vulnerabilities, parallelization is burning tokens without adding breadth. Reduce concurrency or diversify model selection between agents.
+- **For parallel patchers:** Wait for all patches to complete, then select the most minimal and idiomatic fix. If parallel patchers consistently produce cleaner code than a single agent, the compute cost can be justified. Prune immediately when one reproducer agent succeeds to avoid burning the remaining budget.
+
+<Tip>
+When running parallel trajectory experiments, use Tier 2 unit evals to compare configurations on a fixed input set before running against a live target. This gives you a controlled measurement of the marginal value of each additional parallel agent.
+</Tip>
+
+---
+
+## Eval Datasets in the Reference Implementation
+
+The ADK reference implementation includes several eval datasets in `reference/evals/` that cover the core pipeline stages:
+
+| File | Stage | What it tests |
+|---|---|---|
+| `synthetic_dataset.json` | `/mantis-dedupe` | Cluster precision/recall, false merge rate on distinct vulnerability types |
+| `review_dataset.json` | `/mantis-review` | True positive retention, false positive rejection, fatal drop rate |
+| `critic_dataset.json` | `/mantis-critic` | Exploit viability classification accuracy |
+| `calibrate_dataset.json` | `/mantis-calibrate` | Risk score mean absolute error, priority accuracy |
+
+These datasets score on safety-critical metrics: the review eval tracks "fatal drops" (real vulnerabilities incorrectly filtered) and "noise admitted" (false positives allowed through). A model configuration that reduces noise at the cost of fatal drops is the wrong trade-off for a security pipeline.

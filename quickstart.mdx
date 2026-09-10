@@ -1,47 +1,174 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Mantis in 5 Steps"
+sidebarTitle: "Quickstart"
+description: "Run your first Mantis security review: install prerequisites, add skills with npx, open your agent, execute the 16-stage pipeline, and read the report."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
-
-<Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
-
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
-
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
-
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+Mantis runs entirely inside your AI coding agent's working directory. You type slash commands sequentially in the agent's interactive prompt, and each stage writes its output to a shared `workspace/` directory that the next stage reads. This guide walks you through the fastest path to a complete security review — from a clean machine to a finished report.
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  If this is your first time using Mantis, run the pipeline in **Interactive Mode** (human-in-the-loop). Type each slash command individually and review what the agent is about to do before approving any file writes or command executions. This lets you build intuition for the pipeline before you consider any form of automation.
 </Tip>
+
+<Warning>
+  Do **not** launch your coding agent with `--yolo`, `--dangerously-skip-permissions`, or any other automatic-approval flag unless you have fully implemented a hardened, isolated environment (a dedicated VM with no production network access). Without those boundaries, an AI-generated payload could affect your host machine. See the [Installation guide](/installation) for the mandatory hardening requirements.
+</Warning>
+
+<Steps>
+
+  <Step title="Install Docker and gVisor">
+    Mantis uses container runtimes to execute AI-generated proof-of-concept code safely. Install [Docker](https://docs.docker.com/get-docker/) for your platform, then install [gVisor (`runsc`)](https://gvisor.dev/docs/user_guide/install/) to add an extra layer of kernel-level isolation with network disabled.
+
+    After installing both, register the `runsc` runtime with Docker using either the quick command:
+
+    ```bash
+    sudo runsc install -- --network=none && sudo systemctl restart docker
+    ```
+
+    Or add it manually to `/etc/docker/daemon.json`:
+
+    ```json
+    {
+      "runtimes": {
+        "runsc": {
+          "path": "runsc",
+          "runtimeArgs": [
+            "--network=none"
+          ]
+        }
+      }
+    }
+    ```
+
+    Then restart Docker:
+
+    ```bash
+    sudo systemctl restart docker
+    ```
+
+    <Note>
+      gVisor provides the `gvisor` sandbox type used by the `/mantis-reproduce` and `/mantis-patch` skills to run untrusted AI-generated crash reproducers in an isolated environment with networking disabled. If gVisor is unavailable, you can fall back to `static-only` mode, which skips dynamic reproduction.
+    </Note>
+  </Step>
+
+  <Step title="Install the Mantis Skills">
+    Install the Mantis skill set into your project (locally) or across all projects (globally) using `npx`:
+
+    ```shell
+    npx skills add google/mantis
+    ```
+
+    This registers all Mantis slash commands with your coding agent. Alternatively, you can clone the repository directly and ask your coding agent to use the skills from the local directory — the agent can help you with this step.
+
+    <Tip>
+      You can install the skills globally so they are available in every project, or install them locally to scope them to a single workspace. Check your coding agent's documentation for the distinction.
+    </Tip>
+  </Step>
+
+  <Step title="Open Your Agent Inside the Target Project">
+    Navigate to the root of the codebase you want to review, then start your coding agent from that directory:
+
+    ```shell
+    cd /path/to/your/project
+    # Start your agent — for example:
+    gemini
+    # or any other supported coding agent
+    ```
+
+    All Mantis skills read from and write to a `workspace/` subdirectory relative to wherever you launch the agent. Make sure the agent has write access to create this directory.
+  </Step>
+
+  <Step title="Run the Skills Sequentially">
+    Inside the agent's interactive prompt, type the slash commands one at a time in order. Wait for each stage to complete before running the next.
+
+    ```text
+    # 0. (Optional) Analyze repository VCS history and extract past vulnerabilities
+    /mantis-history
+
+    # 0.5. (Optional) Build content-addressed semantic-unit index
+    /mantis-structural-index
+
+    # 1. (Optional) Generate mantis-summary.md directory maps
+    /mantis-summarize
+
+    # 2. Synthesize codebase structure and historical learnings into the Markdown Knowledge Base
+    /mantis-architecture
+
+    # 3. Iteratively develop the project's living threat model based on the KB
+    /mantis-threat-model
+
+    # 4. Map target external boundary and build scanning roadmap, injecting KB references
+    /mantis-plan
+
+    # 5. Run multi-threaded/sequential security flaw sweep using injected context
+    /mantis-researcher
+
+    # 6. Consolidate overlapping files and duplicate bugs
+    /mantis-dedupe
+
+    # 7. Verify code validity & filter false positives
+    /mantis-review
+
+    # 8. Eliminate non-viable production issues
+    /mantis-critic
+
+    # 9. Generate proof-of-concept crash reproducers and run them in sandboxes
+    /mantis-reproduce
+
+    # 10. Combine validated individual findings into multi-step exploit chains
+    /mantis-chain
+
+    # 11. Apply minimal fixes and verify they block the crash reproducer
+    /mantis-patch
+
+    # 12. Calculate final matrix risk ratings and append to individual findings
+    /mantis-calibrate
+
+    # 13. Extract insights from execution trajectories and append to the learnings inbox
+    /mantis-reflect
+
+    # 14. Generate human-readable security review packet report
+    /mantis-report
+    ```
+
+    The `/mantis-reproduce` and `/mantis-patch` stages will attempt to write files and execute code inside sandboxed containers. In Interactive Mode, your agent will pause and ask for your approval before running any sensitive command — **review each action carefully before approving**.
+
+    <Note>
+      The three optional stages at the top (`/mantis-history`, `/mantis-structural-index`, `/mantis-summarize`) enrich the Knowledge Base with VCS context and structural code indexes. They are especially valuable for large repositories or when the pipeline will run in continuous loops. For a first run on a small codebase, you can skip them and start at `/mantis-architecture`.
+    </Note>
+  </Step>
+
+  <Step title="Review the Security Report">
+    When `/mantis-report` completes, it writes the finished security review packet to:
+
+    ```text
+    workspace/report/review_packet-latest.md
+    ```
+
+    Open this file to read the full findings, evidence, risk rationale scores (1–10), and patch information for every verified vulnerability.
+
+    <Warning>
+      **All findings must be manually verified by a qualified security expert before any action is taken.** AI models are non-deterministic and can hallucinate findings or generate incorrect patches. A successful proof-of-concept reproducer does not guarantee exploitability in all contexts. Do not file unverified AI-generated reports to open-source maintainers.
+    </Warning>
+
+    After reviewing the report, you can selectively apply approved patches from `workspace/findings/` to your codebase. To start a fresh review pass (for example, after applying patches or pulling new commits), archive the contents of `workspace/findings/` so it is empty, then loop back to `/mantis-architecture` (Step 2 of the pipeline).
+  </Step>
+
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="gear" href="/installation">
+    Full prerequisites guide: Docker, gVisor daemon config, cloud SDKs, and the ADK reference implementation.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Deep dive into each pipeline stage, inter-stage data contracts, and the schema.json specification.
+  </Card>
+  <Card title="Deterministic Pipelines" icon="shuffle" href="/guides/deterministic-pipelines">
+    Wrap Mantis skills in a production-grade harness for CI/CD, horizontal scaling, and prompt injection resistance.
+  </Card>
+  <Card title="Cloud Deployment" icon="cloud" href="/guides/unattended-gce-deployment">
+    Mandatory hardening steps for running unattended 24/7 reviews on Google Compute Engine.
+  </Card>
+</CardGroup>

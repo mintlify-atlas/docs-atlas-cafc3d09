@@ -1,0 +1,117 @@
+---
+title: "Plan Schema — Mantis Scanning Roadmap Contract"
+sidebarTitle: "Plan"
+description: "Reference for workspace/plan.json — the scanning roadmap written by /mantis-plan and consumed by /mantis-researcher to direct targeted, KB-grounded audits."
+---
+
+The plan file at `workspace/plan.json` is the strategic bridge between the knowledge-building phase and active vulnerability research. It is written by `/mantis-plan` (the Strategist skill) after it has read the Knowledge Base at `workspace/kb/` and the directory summaries from `mantis-summary.md`. The `/mantis-researcher` skill then reads the plan to drive its file-by-file triage and deep security review — each investigation entry tells the researcher exactly which files to audit, which KB documents to use for context, and what specific security questions to investigate. Without a plan file, `/mantis-researcher` falls back to an unguided full-codebase scan.
+
+<Info>
+  The plan file is regenerated on each pipeline pass. `/mantis-plan` also writes `changed_files` and `changed_files_status` to `workspace/.mantis_state.json` alongside the plan, so the researcher can prioritize files that changed since the last pass.
+</Info>
+
+## Schema
+
+The top-level plan object has a single required field.
+
+<ParamField body="investigations" type="object[]" required>
+  An ordered array of investigation tasks for `/mantis-researcher` to execute. Each entry is an independent, self-contained unit of work. The researcher processes them sequentially or in parallel depending on the harness configuration.
+</ParamField>
+
+### Investigation Object
+
+Each element of the `investigations` array is an object with the following required fields:
+
+<ParamField body="title" type="string" required>
+  A concise label for this investigation task, used for logging and progress tracking. Typically identifies the scope (e.g., `"Exhaustive Review: src/api/"` or `"Authentication Bypass Audit: auth_service.py"`).
+</ParamField>
+
+<ParamField body="target_files" type="string[]" required>
+  An array of exact, repo-relative file paths to audit in this investigation. The researcher reads every file listed here. Paths should be precise — this is the authoritative scope boundary for the investigation.
+
+  ```json
+  ["src/api/auth_handler.py", "src/api/session.py", "src/db/query_builder.py"]
+  ```
+</ParamField>
+
+<ParamField body="kb_references" type="string[]" required>
+  An array of paths to Markdown Knowledge Base files that provide architectural and domain context for this investigation. These are read by the researcher as background before examining the target files. Paths are relative to the workspace (e.g., `"workspace/kb/entities/auth.md"`).
+
+  ```json
+  ["workspace/kb/entities/auth.md", "workspace/kb/data_flows/login_flow.md"]
+  ```
+
+  An empty array (`[]`) is valid when no KB context is available or applicable.
+</ParamField>
+
+<ParamField body="question" type="string" required>
+  Detailed prompting instructions for the researcher. This field drives the researcher's focus and depth of analysis. It should describe the specific security concern, the attack surface to evaluate, and any constraints or hypotheses to test (e.g., `"Investigate whether user-supplied path parameters in the file-download endpoint can escape the allowed directory via traversal sequences. Check all path normalization logic."`).
+</ParamField>
+
+---
+
+## Example
+
+The following is a realistic `workspace/plan.json` with one investigation entry targeting an authentication subsystem:
+
+```json
+{
+  "investigations": [
+    {
+      "title": "Authentication Bypass Audit: Login and Session Subsystem",
+      "target_files": [
+        "src/api/auth_handler.py",
+        "src/api/session.py",
+        "src/middleware/jwt_validator.py",
+        "src/db/user_repository.py"
+      ],
+      "kb_references": [
+        "workspace/kb/entities/auth_module.md",
+        "workspace/kb/data_flows/login_flow.md",
+        "workspace/kb/THREAT_MODEL.md"
+      ],
+      "question": "Audit the login, session creation, and JWT validation paths for authentication bypass vulnerabilities. Specifically investigate: (1) whether the JWT signature is verified against a hardcoded or environment-controlled secret; (2) whether the 'alg: none' attack or algorithm confusion (HS256 vs RS256) is possible; (3) whether user-controlled claims (e.g., 'role', 'admin') are trusted without re-verification against the database; (4) whether session tokens have adequate entropy and whether they are invalidated on logout. Check all code paths that call user_repository.get_by_id or equivalent without a privilege check."
+    },
+    {
+      "title": "Path Traversal Audit: File Download Endpoint",
+      "target_files": [
+        "src/api/file_handler.py",
+        "src/utils/path_utils.py"
+      ],
+      "kb_references": [
+        "workspace/kb/entities/file_service.md"
+      ],
+      "question": "Determine whether user-supplied path parameters in the file-download endpoint can traverse outside the allowed base directory. Check all uses of os.path.join, os.path.normpath, and any custom path sanitization. Verify that the final resolved path is checked against the intended base directory after normalization."
+    }
+  ]
+}
+```
+
+<Tip>
+  The `question` field is the most important driver of researcher quality. More specific questions — including named functions, relevant CWE classes, and hypothesized attack vectors — produce more focused and accurate findings than broad generic prompts.
+</Tip>
+
+---
+
+## How the Plan is Used
+
+The plan file connects three pipeline stages in a feedback loop:
+
+<Steps>
+  <Step title="KB Built by /mantis-architecture">
+    `/mantis-architecture` drains `workspace/learnings.jsonl` and synthesizes the codebase structure into interlinked Markdown documents under `workspace/kb/`. This includes entity files, data flow diagrams, and historical vulnerability patterns.
+  </Step>
+  <Step title="Threat Model Established">
+    `/mantis-threat-model` reads and refines `workspace/kb/THREAT_MODEL.md`, defining trust boundaries, attacker profiles, and high-risk assets. These are then referenced in `kb_references`.
+  </Step>
+  <Step title="Plan Written by /mantis-plan">
+    `/mantis-plan` reads the KB indices and directory summaries, identifies the highest-risk attack surfaces, and writes `workspace/plan.json` with one `investigation` entry per audit target. It also writes `changed_files` to `workspace/.mantis_state.json` to allow the researcher to prioritize newly modified code.
+  </Step>
+  <Step title="Research Executed by /mantis-researcher">
+    `/mantis-researcher` reads `workspace/plan.json` and executes each investigation in order (or in parallel). For each investigation, it reads the listed `target_files`, loads the `kb_references` as context, and uses the `question` as a focused research prompt. Discovered vulnerabilities are written as individual JSON files to `workspace/findings/`.
+  </Step>
+</Steps>
+
+<Note>
+  The plan is regenerated at the start of every pipeline pass. `/mantis-plan` uses the `changed_files` diff (when available) to prioritize investigations around recently modified code, and uses historical learnings to avoid re-investigating already-cleared areas.
+</Note>

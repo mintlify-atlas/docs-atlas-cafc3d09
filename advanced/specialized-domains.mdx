@@ -1,0 +1,181 @@
+---
+title: "Adapt Mantis for Specialized Security Domains"
+sidebarTitle: "Specialized Domains"
+description: "Extend Mantis beyond web and cloud apps to hardware RTL, IaC, ML pipelines, compiled firmware, and custom test environments with tailored threat models."
+---
+
+Mantis is designed to be a starting point rather than a rigid set of instructions. While the default skills target generic web and cloud application security — business logic flaws, authorization issues, and common injection vulnerabilities — the same pipeline architecture adapts to a wide range of specialized domains by modifying three things: the threat model focus in your `SKILL.md` files, the domain-specific context injected into your Knowledge Base (KB), and the reproduction environment used for dynamic validation. This page describes five major specialized domains and the practical changes required to target each one.
+
+<Tip>
+We strongly recommend using AI to iterate on the skill files themselves. Feed your internal documentation, hardware datasheets, coding standards, and build system quirks to the KB so the threat model reflects your actual attack surface — not a generic one.
+</Tip>
+
+## The Three Adaptation Levers
+
+Before diving into each domain, understand the three points of customization that apply to all of them:
+
+<Steps>
+  <Step title="Modify the SKILL.md threat model focus">
+    Each skill's `SKILL.md` file contains the instructions and threat context given to the agent. For a specialized domain, update the threat model section to describe domain-relevant attacker profiles, attack primitives, and vulnerability classes. For example, a Hardware/RTL audit should replace injection/XSS with privilege escalation via misconfigured trust zones and timing side-channels.
+  </Step>
+  <Step title="Add domain-specific KB context">
+    The `/mantis-architecture` stage synthesizes a Markdown Knowledge Base in `workspace/kb/`. Supplement it with domain-specific references: hardware datasheets, Terraform module documentation, ML framework deserialization formats, or firmware layout guides. Use internal documentation and coding standards to augment the threat model.
+  </Step>
+  <Step title="Swap the reproduction environment">
+    The `/mantis-reproduce` stage by default writes proof-of-concept scripts that execute inside Docker containers with `--network=none`. For specialized domains, replace this environment with the appropriate sandbox — a QEMU image, a hardware testbed accessed via MCP, a Kubernetes cluster in isolation, or a custom simulator — using the Custom MCP pattern described in the Pipeline Adapter guide.
+  </Step>
+</Steps>
+
+---
+
+## Specialized Domains
+
+<Accordion title="Hardware / RTL Reviews (SystemVerilog, VHDL)">
+
+Hardware security reviews audit Register-Transfer Level (RTL) designs written in SystemVerilog or VHDL for security properties or logical bugs. The attack surface is fundamentally different from software: the concern is not buffer overflows but misconfigured trust zones, debug interface exposure, side-channel leakage, and privilege escalation through hardware state machines.
+
+**Threat model focus:** Replace web/API attacker profiles with a hardware adversary who has physical or JTAG access. Focus the threat model on: security lifecycle registers, debug interface lockdown, privilege separation between firmware-accessible and user-accessible address regions, and timing side-channels in cryptographic state machines.
+
+**KB context to add:** Include the SoC's security architecture document, the trust zone layout, any relevant hardware security specifications (e.g., RISC-V PMP configuration rules), and your organization's RTL security checklist.
+
+**Reproduction environment:** Simulation-based reproduction is standard. Replace the Docker container environment with a hardware simulator (e.g., Verilator, ModelSim) invoked via a custom MCP server. The `/mantis-reproduce` stage can write SystemVerilog testbenches or directed tests targeting the identified vulnerability pattern, and the MCP server executes them in the simulator and captures the waveform or assertion failure output.
+
+**Key vulnerability classes to configure in `/mantis-researcher`:**
+- Misconfigured security lifecycle state machines
+- Debug interface exposure after production lockdown
+- Privilege escalation via incorrect address decoder logic
+- Race conditions on shared registers between security domains
+- Hard-coded test keys or bypass modes not removed before tapeout
+
+</Accordion>
+
+<Accordion title="Infrastructure-as-Code (Terraform, Kubernetes RBAC)">
+
+IaC security reviews analyze cloud deployment boundaries, Terraform state and module configurations, and Kubernetes RBAC definitions for privilege escalation paths, overly permissive policies, and network exposure.
+
+**Threat model focus:** The attacker starts with a compromised workload (e.g., a pod with a leaked service account token) and attempts lateral movement or privilege escalation through misconfigured IAM bindings, overly broad RBAC roles, or exploitable Terraform module outputs. Focus the threat model on: blast radius of a compromised identity, lateral movement via `ClusterRoleBinding` scope, and data exfiltration paths enabled by storage policies.
+
+**KB context to add:** Include your cloud provider's IAM reference documentation, internal naming conventions for service accounts, the network policy schema for your Kubernetes clusters, and any compliance requirements (e.g., specific CIS benchmark controls relevant to your stack).
+
+**Reproduction environment:** For IaC auditing, dynamic reproduction often means deploying a minimal test environment. The `/mantis-reproduce` stage can be configured to generate `kubectl` or `terraform apply` commands against an isolated dev cluster or a Terratest harness, with the MCP server enforcing that no production state is ever touched. For privilege escalation findings, the reproducer demonstrates the escalation path in an ephemeral cluster namespace.
+
+**Key vulnerability classes to configure in `/mantis-researcher`:**
+- `ClusterRole`/`ClusterRoleBinding` granting wildcard permissions
+- Service accounts with `automountServiceAccountToken: true` in sensitive namespaces
+- Terraform IAM bindings granting broad roles (`roles/editor`, `roles/owner`)
+- Publicly accessible storage buckets or databases in Terraform modules
+- Network policies that allow unrestricted ingress from `0.0.0.0/0`
+
+</Accordion>
+
+<Accordion title="Data & ML Pipelines (Training Data Ingress, Pickle Vulnerabilities)">
+
+Data and ML pipeline security reviews audit the boundary between untrusted data sources and model training or inference infrastructure. The attack surface includes training data ingress points where adversarial inputs could influence model behavior, model serialization formats that permit arbitrary code execution, and the boundary between exploratory data science notebooks and hardened production pipelines.
+
+**Threat model focus:** The attacker controls a portion of the training data or a model artifact file, or has indirect influence over an ML pipeline input. Focus the threat model on: arbitrary code execution via `pickle.load()` of untrusted model files, data poisoning via unvalidated training data ingress, prompt injection in LLM-backed pipeline steps, and unauthorized model exfiltration via ML platform APIs.
+
+**KB context to add:** Include your ML framework documentation (PyTorch, TensorFlow, JAX), serialization format specs (Pickle, safetensors, ONNX), the data pipeline DAG topology, and any internal data governance policies governing which sources are trusted.
+
+**Reproduction environment:** Reproduce Pickle execution vulnerabilities with a sandboxed Python environment (gVisor is well-suited here) that loads the adversarial artifact and demonstrates code execution. For data poisoning findings, the reproducer typically demonstrates the injection point rather than the full training loop, since full model training is cost-prohibitive. Use `--network=none` strictly to prevent any callback to attacker infrastructure during reproduction.
+
+**Key vulnerability classes to configure in `/mantis-researcher`:**
+- `pickle.load()` / `torch.load()` called on data from untrusted sources without `weights_only=True`
+- Model files fetched from external URLs without integrity verification
+- Jupyter notebooks that read from user-controlled paths and execute in privileged environments
+- ML pipeline steps that pass user-controlled strings into `eval()` or `subprocess`
+- Missing input validation at training data ingress boundaries
+
+</Accordion>
+
+<Accordion title="Compiled Binaries & Firmware (Gray-Box Auditing)">
+
+Compiled binary and firmware auditing uses the pipeline in gray-box mode: the agent operates without source code, using reverse engineering tools to analyze release artifacts. This mode deliberately emulates a third-party security researcher's perspective — discovering only what an adversary with access to your released binaries can find.
+
+**Threat model focus:** The attacker has obtained the firmware image or release binary through standard means (public download, firmware update mechanism, or physical device extraction). Focus the threat model on: memory corruption in parsing routines, hardcoded credentials in firmware strings, insecure bootloader chain-of-trust, exposed debug interfaces, and command injection via network-accessible management interfaces.
+
+**Tools to configure:** The agent should be given access to `unblob` (firmware extraction), `Ghidra` or `radare2` (static binary analysis and decompilation), `qemu` (full-system emulation for dynamic analysis), and `unicorn` (lightweight CPU emulation for isolating specific functions). These tools are invoked by the agent through the standard `run_command` tool interface.
+
+**KB context to add:** Provide the firmware's known architecture (ARM Cortex-A, MIPS, x86), the chipset documentation if available, any prior CVEs for the product family, and your internal vulnerability taxonomy for embedded systems.
+
+**Reproduction environment:** QEMU-based full-system emulation is the standard sandbox for firmware reproduction. Configure the `/mantis-reproduce` stage to write exploits that execute inside a QEMU guest image with networking isolated. For cases where QEMU emulation is not feasible (hardware-specific peripherals), the Custom MCP pattern can interface with physical hardware testbeds over USB or serial.
+
+**Key vulnerability classes to configure in `/mantis-researcher`:**
+- Stack/heap buffer overflows in packet parsing or HTTP server code
+- Format string vulnerabilities in logging or CLI handlers
+- Hardcoded credentials, API keys, or private keys in firmware strings
+- Unsigned or weakly authenticated firmware update mechanisms
+- Command injection via `system()` or `popen()` with unsanitized network input
+
+</Accordion>
+
+<Accordion title="Custom Test Environments (VMs, Hardware Testbeds, Simulators)">
+
+Some targets cannot be reproduced in a standard Docker container: physical hardware accessible via USB or serial, custom application simulators, staging environments behind VPNs, or legacy systems that require specific VM configurations. Mantis supports all of these through the Custom MCP pattern.
+
+**Architecture:** Replace the default container reproduction environment with a Model Context Protocol (MCP) server that exposes a clean, restricted API to the reproduction agent:
+
+```
+[mantis-reproduce agent] <--- MCP ---> [Custom MCP Server] <--- API ---> [Target Environment]
+```
+
+**MCP tool examples by environment type:**
+
+<Tabs>
+  <Tab title="Physical Hardware (USB/Serial)">
+    ```python
+    # Custom MCP server tools for hardware testbed
+    power_cycle_device()        # Power via smart plug API
+    send_usb_packet(payload)    # Raw USB HID/bulk transfer
+    read_serial_output(timeout) # Capture UART/serial console
+    flash_firmware(image_path)  # Write test firmware to device
+    ```
+  </Tab>
+  <Tab title="VM-Based Environment">
+    ```python
+    # Custom MCP server tools for VM testbed
+    reboot_vm(vm_id)                    # Clean VM state reset
+    execute_payload(vm_id, payload)     # Run command inside VM
+    snapshot_vm(vm_id, label)           # Save known-good state
+    restore_snapshot(vm_id, label)      # Reset to known-good state
+    capture_crash_dump(vm_id)           # Retrieve crash artifacts
+    ```
+  </Tab>
+  <Tab title="Custom Simulator">
+    ```python
+    # Custom MCP server tools for simulator
+    load_scenario(config_path)          # Initialize simulation
+    inject_input(channel, data)         # Feed crafted input
+    step_simulation(cycles)             # Advance simulator state
+    read_state(register_or_address)     # Inspect simulator state
+    check_assertion(assertion_name)     # Verify security property
+    ```
+  </Tab>
+</Tabs>
+
+**Key design principles:**
+- The MCP server is the only component with access to the target environment. The agent never interacts with the target directly.
+- All payloads generated by the agent pass through the MCP server, which can enforce safety constraints (e.g., refusing to brick production devices, enforcing rate limits on physical hardware).
+- The harness should implement a Human-in-the-Loop gate before invoking any Tier 4 (staging/live) execution, requiring explicit operator confirmation or a signed approval token.
+
+</Accordion>
+
+---
+
+## Adapting with AI Assistance
+
+You do not need to write domain-specific skill modifications entirely by hand. Use your AI coding agent to assist:
+
+<CardGroup cols={2}>
+  <Card title="Iterate on SKILL.md files" icon="file-pen">
+    Ask your coding agent to review your existing `SKILL.md` files and rewrite the threat model section for your target domain, using your internal documentation as context.
+  </Card>
+  <Card title="Augment the KB" icon="database">
+    Feed internal coding standards, architecture diagrams, and domain-specific references to `/mantis-architecture` to build a richer Knowledge Base that reflects your actual attack surface.
+  </Card>
+  <Card title="Generate MCP server stubs" icon="server">
+    Ask your agent to scaffold the Custom MCP server for your target environment type, specifying the tools the reproduction agent will need.
+  </Card>
+  <Card title="Adapt risk calibration" icon="gauge">
+    Update `/mantis-calibrate` and `/mantis-critic` to reflect domain-specific exploitability constraints — for example, firmware vulnerabilities that require physical access have different risk profiles than remote code execution.
+  </Card>
+</CardGroup>

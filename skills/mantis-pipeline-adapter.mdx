@@ -1,0 +1,330 @@
+---
+title: "/mantis-pipeline-adapter: Custom Harness Design Guide"
+sidebarTitle: "/mantis-pipeline-adapter"
+description: "Interactive consultant for building custom Mantis harnesses: deterministic pipelines, token efficiency, MCP reproducers, SAST seeding, and code indexing."
+---
+
+The `/mantis-pipeline-adapter` skill is an interactive pipeline design consultant. It helps developers and platform engineers design and build custom deterministic orchestrator harnesses that wrap Mantis skills — whether that means a bespoke CLI, an ADK agent pipeline, an MCP-native workflow, or any programmatic harness tailored to a specific tech stack, execution environment, or scale requirement. Use it when you want to build your own pipeline rather than using the reference `mantis-meta-agent`. Do not use it to execute the default pipeline directly — for that, use `/mantis-launch` or `/mantis-meta-agent`.
+
+## Command
+
+```text
+/mantis-pipeline-adapter
+```
+
+This skill operates as an interactive consulting session. It reads the user's context and goals, then provides tailored architecture guidance, reference code patterns, and implementation advice.
+
+## Input / Output Contract
+
+**Reads:**
+
+| Source | Purpose |
+|---|---|
+| `workspace/.mantis_state.json` | Current pass state, `active_snapshot`, `snapshot_history`, `vcs_info` |
+| `schema.json` | Canonical pipeline specification and inter-stage data contracts |
+| `workspace/findings/*.json` | State store reference for harness design guidance |
+| `workspace/learnings.jsonl` | Memory rotation patterns |
+| User's interactive configuration input | Goals, stack, environment, and scale requirements |
+
+**Writes:**
+
+User-customized orchestrator harness code, configurations, or architecture documentation — based on what the user needs.
+
+**Idempotency:** As a consulting agent, the adapter advises the user to implement idempotency in their custom harness using three mechanisms: (1) state store synchronization, (2) atomic transactional file/VCS operations, and (3) proper locks (database or file-level).
+
+## Consultation Scope
+
+The adapter covers these areas during a session:
+
+<Steps>
+  <Step title="Understand user context">
+    Target programming language, agent framework (if any), execution environments (VMs, local containers, physical hardware), and scale requirements.
+  </Step>
+  <Step title="Recommend core principles">
+    Four foundational patterns for every harness:
+
+    - **Deterministic Orchestration** — use code (not LLM) for control flow
+    - **State Store** — filesystem or database as single source of truth
+    - **Token Efficiency** — UUID-based referencing to avoid LLM text duplication
+    - **Custom Environment Integration** — MCP servers for isolated testing or hardware interaction
+  </Step>
+  <Step title="Ensure schema consistency">
+    Strict adherence to the inter-stage data contracts defined in `schema.json` — the canonical pass lifecycle contract, `active_snapshot` schema, `snapshot_history`, finding JSON fields, and invariant labels.
+  </Step>
+  <Step title="Adaptive design">
+    Draft code and architecture tailored to the user's specific stack rather than imposing a rigid template.
+  </Step>
+  <Step title="Advise on scale and concurrency">
+    Pipeline decomposition, database or file locking, parallel trajectory search, and horizontal scaling patterns.
+  </Step>
+  <Step title="Suggest evaluations">
+    Empirical evaluation of cheaper models for utility stages (deduplication, calibration) before deploying to production.
+  </Step>
+</Steps>
+
+## Reference Architecture Guidelines
+
+The adapter uses the following guidelines as its technical reference. These are the numbered patterns it advises users to implement.
+
+### Core Principles
+
+The reference architecture separates concerns cleanly across four pillars:
+
+<CardGroup cols={2}>
+  <Card title="Deterministic Orchestration" icon="code">
+    The LLM never decides control flow. A programmatic harness calls skills sequentially or in parallel. No LLM-decided branching.
+  </Card>
+  <Card title="State on Disk / Database" icon="database">
+    `workspace/findings/*.json` or a database is the single source of truth. For horizontal scaling, use a centralized database with locking.
+  </Card>
+  <Card title="Deterministic Reporting" icon="file-lines">
+    Use deterministic scripts to render JSON findings into reports or upload them to bug trackers. Use an LLM only for non-deterministic subsets (e.g., executive summary text).
+  </Card>
+  <Card title="Token Efficiency" icon="bolt">
+    LLM outputs return only minimum necessary information (UUIDs, status codes). Pre-written helper scripts handle JSON manipulation — never generate one-off scripts for routine state updates.
+  </Card>
+</CardGroup>
+
+### Guideline 1: UUID-Based Referencing Pattern
+
+The primary token-efficiency technique. All findings are identified by UUIDs; LLMs receive only `id + summary`, never full JSON blobs.
+
+The deduplication stage exemplifies this pattern:
+
+1. **Harness** reads all findings and prepares a summary list: `[{ "id": "UUID", "file": "path", "line": 12, "snippet": "..." }]`
+2. **LLM** outputs only a duplicate mapping: `{ "primary_uuid_1": ["dup_a", "dup_b"] }`
+3. **Harness (deterministic)** reads, merges, and updates finding files; moves duplicates to `workspace/findings/.trash/`
+
+### Guideline 2: Adaptable Reproducers via Custom MCP
+
+When the reproducer needs to interact with diverse environments (VMs, physical hardware), expose a clean restricted API via the Model Context Protocol:
+
+```text
+[Reproducer Agent] <--- MCP ---> [Custom MCP Server] <--- API ---> [Target Env]
+```
+
+Custom tool examples:
+- **VMs:** `reboot_vm()`, `execute_payload()`
+- **Hardware/USB:** `power_cycle_device()`, `send_usb_packet()`
+
+<Note>
+If the harness uses raw LLM APIs (e.g., direct Gemini API calls) instead of an MCP-native client framework, the harness must manually register these tools in the API's schema format and dispatch tool calls to the MCP server.
+</Note>
+
+### Guideline 3: Decomposition and Multi-Model Strategy
+
+Match model complexity to task requirements:
+
+| Task complexity | Model tier |
+|---|---|
+| Deep reasoning (Research, Reproduce, Patch) | Frontier Models |
+| Structured utility tasks (Dedupe, Calibrate) | Flash / Lite Models |
+| Research stage diversity | Run multiple models in parallel to increase bug-hunting coverage |
+
+For parallel trajectory search (Reproducer, Patcher): spawn multiple agents on the same finding. For the Reproducer, prune all trajectories as soon as one succeeds. For the Patcher, wait for all patches and select the most minimal, idiomatic, correct fix.
+
+### Guideline 4: The Planning Stage and workspace/plan.json
+
+`/mantis-plan` generates `workspace/plan.json` with targeted investigations, context pointers, and specific research questions. `/mantis-researcher` reads it at startup. This decoupling of strategy and execution allows the harness to:
+- Parallelize sweeps across independent investigations
+- Inject context pointers (KB references, threat model sections) without embedding full content
+- Maintain historical context across passes without repeating work
+
+### Guideline 5: The Pass Lifecycle Contract (Living / Synced Codebases)
+
+Any custom harness that supports `--sync` (continue-after-edits) must implement the **harness-agnostic Pass Lifecycle Contract** defined in `schema.json` under "Non-JSON Contracts". A harness is **conformant** if, per pass, it:
+
+1. **SYNCs first** (Block C) — the very first action of the pass, never mid-pass
+2. **Detects `vcs_info` + computes `SNAPSHOT_ID`** — only after sync
+3. **PINs** the immutable copy, writes the sentinel (`CODE_ROOT/.mantis_snapshot_id`), and **appends** to `snapshot_history`
+4. **Records** `vcs_info` and `active_snapshot` — never records a snapshot ID before syncing
+5. **Runs every stage** with `--snapshot_root`, `--snapshot_id`, and `--state_root`
+6. **Archives and increments** (Stage 15); retried findings keep their original `discovery_commit`
+
+A harness that does not implement the contract must leave `snapshot_pinned` unset, preserving today's single-snapshot behavior.
+
+<Accordion title="Advisory notes for harness builders">
+
+**Opt-in, default off.** A harness that never sets `snapshot_pinned` behaves exactly like today. Absent `active_snapshot` / `discovery_commit` is the conservative branch — never treat these as errors.
+
+**Store snapshots OUTSIDE `workspace/`.** The pinned copy must live under `<state_root>/.mantis_snapshots/pass_<N>` and its path must NOT contain the segment `/workspace/` — otherwise `mantis-patch`'s state-vs-code path guard misfires.
+
+**Non-destructive sync only.** Never run `git reset --hard`, `git checkout -- .`, `git clean`, or `hg update -C`. User edits and in-progress work must survive every pass.
+
+**Full-fidelity SNAPSHOT_IDs.** The ID is computed over the whole pinned copy:
+- Clean git/hg → `commit_hash`
+- Dirty git/hg → `commit_hash:content_hash`
+- Multi-VCS → `revision:content_hash`
+- No VCS → `content:<content_hash>`
+
+An unchanged dirty tree will match across passes; a `repo sync` that advances commits under an unchanged manifest revision will compare unequal.
+
+**Pass all three roots to EVERY stage** — including findings-only stages (report, calibrate, reflect). They do not read target code, but they read `active_snapshot` for provenance.
+
+</Accordion>
+
+#### Conformance Scenarios
+
+The adapter walks builders through six reference scenarios that expose the key correctness invariants:
+
+<Accordion title="Scenario 1: Colocated state">
+  `state_root` is nested inside `CODE_ROOT` (the default when launching from inside the target repo). The `SNAPSHOT_ROOT` path must not contain `/workspace/` — otherwise `mantis-patch`'s state-vs-code path guard misfires. The safe default is HALT-and-yield; opt-in auto-relocation moves `workspace/` and `.mantis_snapshots/` atomically outside `CODE_ROOT`.
+
+  **Key concern:** Token efficiency — the snapshot copy excludes `workspace/` but only if `state_root` is correctly separated from `CODE_ROOT`.
+</Accordion>
+
+<Accordion title="Scenario 2: Stale active_snapshot (pass mismatch)">
+  `active_snapshot.pass != state.pass_number` — Stage 15 preserved `active_snapshot` while incrementing `pass_number`. Block D step 0 handles same-pass re-entry only; it does NOT catch cross-pass staleness.
+
+  **Required harness behavior:** Either re-pin every pass (reference behavior), or inject a pre-stage gate that clears `active_snapshot` before invoking stages. Stages cannot self-detect this staleness via Block B (which is snapshot_id-only, not pass-aware).
+</Accordion>
+
+<Accordion title="Scenario 3: Pin failure (HALT mode)">
+  Snapshot copy fails — disk full, permissions error, tree too large. Block D step 5b: `SNAPSHOT_ROOT=<live root>`, `snapshot_pinned=false`, `SNAPSHOT_ID="live:"+ISO8601`. The harness still writes `active_snapshot` and passes roots to all stages. All authoritative verdicts are forbidden this pass.
+</Accordion>
+
+<Accordion title="Scenario 4: Patched shadows">
+  `mantis-patch` passes `--target_root=<PATCHED_SHADOW_ROOT>` to the re-attack reproduce sub-agent. Block A step 1a: `CODE_ROOT = --target_root` (authoritative override). Block A step 2: sentinel check SKIPPED (sentinel-exempt). The finding's `discovery_commit` is unaffected.
+</Accordion>
+
+<Accordion title="Scenario 5: Different-snapshot duplicate candidates">
+  Cross-pass dedupe where `discovery_commit` differs. Block B pairwise check returns NOT_MATCHED → finding stays ACTIVE with `possible_duplicate_of`. If the archived finding was RESOLVED, this is flagged as a POSSIBLE REGRESSION.
+</Accordion>
+
+<Accordion title="Scenario 6: Absent sink evidence">
+  PoC compiles but produces no reached-sink evidence. Block F: `repro_status = not_attempted` (retry-eligible), NEVER `failed_to_reproduce`. `failed_to_reproduce` is reserved for when the harness provably reached the vulnerable entrypoint and the bug still did not fire.
+</Accordion>
+
+### Guideline 6: Semantic Retrieval (RAG) for Large Codebases
+
+For thousands of source files, a semantic retrieval layer lets planners and researchers query relevant KB entries without reading everything:
+
+<Tabs>
+  <Tab title="Option A — Skill-Based (Default)">
+    A dedicated skill reads `workspace/kb/chunks.jsonl` and runs a BM25/TF-IDF helper script (`workspace/helpers/search_chunks.py`, `# MANTIS_HELPER_VERSION = 1`). Zero external dependencies — works air-gapped, no vector store required.
+
+    Two chunk types in `chunks.jsonl`:
+    - **KB chunks:** extracted from `workspace/kb/*.md` — `{ "id", "source_file", "entity_type", "chunk_text" }`
+    - **Code chunks:** from `CODE_ROOT` (pinned snapshot) — `{ "id", "source_file", "start_line", "end_line", "chunk_text" }`
+
+    First line is a provenance header: `{ "_provenance": true, "snapshot_id": "abc123" }`. Rebuild when `snapshot_id` differs from current SNAPSHOT_ID.
+
+    A complete reference blueprint is at `references/mantis-kb-query.md`.
+  </Tab>
+  <Tab title="Option B — MCP-Based (Maximum Scale)">
+    The harness owns a persistent vector index serving two MCP tools:
+
+    ```
+    semantic_search_kb(query: string) → [{id, source_file, entity_type, chunk_text, score}]
+    semantic_search_code(query: string) → [{file, start_line, end_line, snippet, score}]
+    ```
+
+    The harness manages the vector index lifecycle: build from `chunks.jsonl`, rebuild when `SNAPSHOT_ID` changes. In HALT mode, serve with a `STALE` flag or refuse. In MODE-OFF, skip entirely.
+  </Tab>
+</Tabs>
+
+<Warning>
+Retrieval results are **coverage HINTs only** — they decide ordering and prioritization, never the membership of the audit set. A miss must never cause a file, call-site, or investigation to be skipped.
+</Warning>
+
+### Guideline 7: Embedding-Based Deduplication Pre-Filtering
+
+When hundreds of findings accumulate across many passes, the harness can use embeddings as a fast pre-filter before `/mantis-dedupe` runs, reducing the candidate space from O(n×m) LLM comparisons. The skill's existing deterministic matching remains the **sole authority** for hard dedup decisions.
+
+**Cloud vector backend options for enterprise scale:**
+
+| Engine | Best for |
+|---|---|
+| Cloud Spanner Vector Search | Mission-critical pipelines requiring global ACID consistency and 99.999% availability |
+| Cloud SQL for PostgreSQL (`pgvector`) | Standard enterprise relational backends with ACID compliance |
+| AlloyDB for PostgreSQL | High-throughput multi-agent audit farms with concurrent research waves |
+| BigQuery Vector Search | Batch analytical processing and cross-campaign vulnerability lineage analysis |
+
+### Guideline 8: SAST Seeding (External Tool Ingestion)
+
+For LLMs that structurally under-detect whole-program taint classes, a SAST seeding adapter ingests external tool findings (CodeQL, Semgrep, Bandit) as `PROVISIONALLY_VALID` / `NEEDS_RESEARCH` candidates that must earn their verdict through unchanged downstream gates.
+
+The adapter consumes a **platform-agnostic JSONL intermediate representation (IR)** rather than SARIF directly:
+
+```json
+{"_provenance": true, "scan_snapshot_id": "abc123", "tool": "codeql", "tool_version": "2.15.0", "scan_timestamp": "2026-07-22T10:00:00Z"}
+{"rule_id": "cpp/sql-injection", "rule_name": "SQL injection", "cwe": "CWE-89", "severity": "HIGH", "code_paths": ["src/db/query.c:42"], "message": "User input flows into SQL query without sanitization"}
+```
+
+Allow-listing (`workspace/sast_allowlist.json`) controls noise: default is CRITICAL+HIGH only, `per_rule_cap=5`, `total_cap=50`. This protects the reproduce stage's 6-attempt retry cap from being exhausted by low-signal seeds.
+
+Seeded findings enter `workspace/findings/` before `/mantis-dedupe` and flow through all unchanged downstream gates.
+
+A complete reference blueprint is at `references/mantis-sast-seed.md`.
+
+### Guideline 9: Structural Code Index (AST-Level Context)
+
+For large codebases where grep-based call-site discovery is unreliable, an optional structural code index provides AST-level context (function boundaries, call graphs, symbol tables):
+
+<Tabs>
+  <Tab title="Option A — Skill-Based (Default)">
+    The `mantis-structural-index` skill generates and runs helper scripts (`build_structural_index.py` and `query_structural_index.py`, `# MANTIS_HELPER_VERSION = 5`). Uses capability-based per-partition backend selection, degrading to grep.
+
+    Outputs: `workspace/kb/structural_index/manifest.json` + `catalog.sqlite`, with `workspace/helpers/query_structural_index.py` as the query interface.
+
+    Runs immediately after snapshot pinning (Block D) and before the first code-reading analysis stage.
+  </Tab>
+  <Tab title="Option B — MCP-Based">
+    The harness owns a persistent structural index serving MCP tools:
+
+    ```
+    find_callers(symbol)
+    find_callees(function)
+    get_function_boundary(file, line)
+    ```
+
+    Backed by the same SQLite serving store. Consumers must use the query interface, not filter JSONL directly.
+  </Tab>
+</Tabs>
+
+**Per-skill consumption:**
+- `mantis-researcher`: `find_callers()` SUPPLEMENTS grep as a ranking HINT for call-site discovery. It MUST NEVER replace the exhaustive Step-3 sweep. Audit the **union** of grep and structural index results.
+- `mantis-plan`: Uses `find_callees` for function-level dependency fan-out.
+- `mantis-architecture`: Cross-references the index with `dependencies.json` during KB synthesis.
+
+<Warning>
+The structural index is a **coverage HINT only** — it decides ordering, never membership of the audit set. A miss must never cause a call-site or investigation to be skipped or dropped.
+</Warning>
+
+### Guideline 10: Tiered Iterative Reproduction and Multi-Conversation Retries
+
+For complex services, single-shot reproduction often fails. The tiered strategy breaks reproduction into incremental milestones:
+
+| Tier | Description | Retry budget |
+|---|---|---|
+| 1–2 | Setup validation and unit-level verification | Internal sub-budget (max 3 trial executions per conversation); does NOT consume the 6-attempt cap |
+| 3 | Full sandboxed service execution — the only tier that increments the 6-attempt cap | Hard ceiling of 6 attempts (absolute, never reset) |
+| 4 | Staging / live pre-production execution | **Harness-enforced only**, with mandatory human-in-the-loop gate |
+
+**Inter-conversation retry pattern:** When intra-conversation retries fail to reach Tier 3, the orchestrator terminates the stalled conversation and launches a **new subagent conversation** with structured attempt data from `.repro_attempts.json` and trajectory learnings. This eliminates context bloat and reasoning inertia without losing prior empirical observations.
+
+**Tier 4 gate (harness-enforced only):** The harness must never automatically invoke remote execution. It must enforce a **programmatic Human-in-the-Loop gate**: explicit interactive confirmation or a cryptographically signed approval token. If human approval is missing, Tier 4 is skipped and the Tier 3 verdict remains authoritative.
+
+## Usage
+
+Start an interactive design session:
+
+```text
+/mantis-pipeline-adapter
+```
+
+The adapter will ask about your target language, framework, environments, and scale, then walk through the relevant guidelines above.
+
+## Notes
+
+<Note>
+The `schema.json` file at the repository root is the **canonical pipeline specification reference**. It defines the pass lifecycle contract, all finding JSON fields, the `active_snapshot` / `snapshot_history` schemas, and the invariant labels (INV-1 through INV-6) that safety properties are named after.
+</Note>
+
+<Tip>
+Start with Guideline 1 (UUID-based referencing) and Guideline 4 (planning stage) before tackling the more advanced snapshot lifecycle (Guideline 5). These two patterns alone significantly improve token efficiency and reduce LLM context bloat in any custom pipeline.
+</Tip>
+
+<Tip>
+The SAST seeding pattern (Guideline 8) and structural index (Guideline 9) are both **opt-in and additive**. Neither modifies existing skills. They are safe to introduce into a running pipeline at any pass boundary.
+</Tip>

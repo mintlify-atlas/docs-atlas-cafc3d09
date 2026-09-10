@@ -1,0 +1,215 @@
+---
+title: "Configure AI Models for Each Pipeline Stage"
+sidebarTitle: "Models"
+description: "Set MANTIS_MODEL, per-node model overrides, and provider routing for Gemini, Claude, and custom OpenAI-compatible endpoints across all pipeline stages."
+---
+
+Mantis is model-agnostic: it works with Gemini models via Google AI Studio or Vertex AI, Claude models via Vertex AI Model Garden, and any OpenAI-compatible endpoint. Choosing the right model for each pipeline stage is one of the highest-leverage optimizations available to you — heavy frontier models for deep reasoning stages, fast flash models for triage and deduplication — and Mantis supports per-node overrides so you can tune this precisely.
+
+## Recommended Models
+
+The reference implementation ships with a curated list of recommended models. These are the models the implementation has been validated against:
+
+| Model ID | Provider | Tier |
+|----------|----------|------|
+| `gemini-3.7-flash` | Google (Vertex AI or AI Studio) | General purpose |
+| `gemini-3.5-flash-lite` | Google (Vertex AI or AI Studio) | Fast / triage |
+| `vertex_ai/claude-opus-5` | Anthropic via Vertex AI | Heavy reasoning |
+| `vertex_ai/zai_org/glm-5.2-maas` | ZhipuAI via Vertex AI MaaS | Alternative frontier |
+
+The default model in the reference implementation is `vertex_ai/gemini-3.7-flash`.
+
+## Model Selection Strategy
+
+Not every pipeline stage requires a powerful frontier model. Tiering your models by task complexity can dramatically reduce cost and latency without sacrificing quality.
+
+<CardGroup cols={2}>
+  <Card title="Tier 1 — Fast / Triage" icon="bolt">
+    Use `gemini-3.5-flash-lite` for stages that require rapid text parsing rather than deep reasoning: `/mantis-history`, `/mantis-structural-index`, `/mantis-summarize`, and `/mantis-dedupe`. These tasks classify and cluster information at scale. A fast model keeps the pipeline moving without bottlenecks.
+  </Card>
+  <Card title="Tier 2 — Deep Reasoning" icon="brain">
+    Use your most capable model for `/mantis-reproduce` (writing functional crash reproducers) and `/mantis-patch` (generating side-effect-free code fixes). These stages require deep context, zero-shot problem solving, and the ability to iterate on compiler or runtime feedback. The `workflow.json` defaults set `reasoning_effort: "high"` for both.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Experiment with different tiers in different parts of your pipeline. Try cheaper models for stages like `/mantis-review` and `/mantis-calibrate` and measure whether finding quality degrades before committing to a cost reduction.
+</Tip>
+
+The reference `workflow.json` demonstrates this tiering across all 16 nodes. Nodes that handle structural indexing, summarizing, and deduplication are assigned `vertex_ai/gemini-3.5-flash-lite` with `reasoning_effort: "low"`, while the reproducer, patcher, and critic are assigned the global default with `reasoning_effort: "high"`.
+
+## Environment Variables
+
+All model configuration can be driven through environment variables. The precedence order is: **global CLI override > `MANTIS_MODEL` env var > per-node `model` field in `workflow.json` > `MODEL_ID` env var > `default_model` in config**.
+
+<ParamField path="MANTIS_MODEL" type="string">
+  Global model override. Takes precedence over all per-node `model` fields in `workflow.json`. Set this to force every stage to use the same model.
+  ```bash
+  export MANTIS_MODEL="vertex_ai/claude-opus-5"
+  ```
+</ParamField>
+
+<ParamField path="MODEL_ID" type="string">
+  Fallback model ID. Used when no per-node override and no `MANTIS_MODEL` are set.
+  ```bash
+  export MODEL_ID="gemini-3.7-flash"
+  ```
+</ParamField>
+
+<ParamField path="VERTEXAI_PROJECT" type="string">
+  GCP project ID for Vertex AI routing. When set (and `GEMINI_API_KEY` is absent), bare `gemini-*` model IDs are automatically prefixed with `vertex_ai/`.
+  ```bash
+  export VERTEXAI_PROJECT="my-gcp-project"
+  ```
+</ParamField>
+
+<ParamField path="GOOGLE_CLOUD_PROJECT" type="string">
+  Alternative to `VERTEXAI_PROJECT`. The implementation checks both variables.
+</ParamField>
+
+<ParamField path="GEMINI_API_KEY" type="string">
+  Google AI Studio API key. When set, bare `gemini-*` IDs route to Google AI Studio rather than Vertex AI.
+  ```bash
+  export GEMINI_API_KEY="AIza..."
+  ```
+</ParamField>
+
+<ParamField path="LLM_API_BASE" type="string">
+  Custom base URL for OpenAI-compatible endpoints (vLLM, Ollama, LiteLLM proxy, etc.).
+  ```bash
+  export LLM_API_BASE="http://localhost:8000/v1"
+  ```
+</ParamField>
+
+<ParamField path="LLM_TIMEOUT" type="number">
+  LLM request timeout in seconds. Also accepted as `LLM_REQUEST_TIMEOUT`.
+  ```bash
+  export LLM_TIMEOUT=120
+  ```
+</ParamField>
+
+<ParamField path="REASONING_EFFORT" type="string">
+  Default reasoning effort level (`low`, `medium`, `high`). Applied when no per-node `reasoning_effort` field is set.
+  ```bash
+  export REASONING_EFFORT="high"
+  ```
+</ParamField>
+
+## Per-Node Model Override in workflow.json
+
+You can assign a different model and reasoning effort to any individual node in the `workflow.json` graph. A per-node `model` field overrides the global `config.default_model` for that specific stage.
+
+```json
+{
+  "config": {
+    "default_model": "vertex_ai/gemini-3.7-flash",
+    "reasoning_effort": "medium"
+  },
+  "nodes": [
+    {
+      "id": "history",
+      "type": "agent",
+      "skill": "../mantis-history",
+      "model": "vertex_ai/gemini-3.5-flash-lite",
+      "reasoning_effort": "low"
+    },
+    {
+      "id": "reproducer",
+      "type": "agent",
+      "skill": "../mantis-reproduce",
+      "reasoning_effort": "high",
+      "timeout": 180.0
+    },
+    {
+      "id": "patcher",
+      "type": "agent",
+      "skill": "../mantis-patch",
+      "reasoning_effort": "high",
+      "timeout": 180.0
+    }
+  ]
+}
+```
+
+Nodes without an explicit `model` field inherit `config.default_model`.
+
+## How normalize_model_id() Routes Bare Model Names
+
+The `normalize_model_id()` function in `reference/core/config.py` automatically routes bare `gemini-` model IDs to Vertex AI when a GCP environment is detected:
+
+```python
+def normalize_model_id(model_id: str) -> str:
+    if model_id.startswith("gemini-"):
+        # Route to vertex_ai/ when VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT
+        # is set and GEMINI_API_KEY is absent
+        if not os.environ.get("GEMINI_API_KEY") and (
+            os.environ.get("VERTEXAI_PROJECT")
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        ):
+            return f"vertex_ai/{model_id}"
+    # GLM-5.2-MaaS aliases are normalized to the canonical path
+    if model_id in ("glm-5.2-maas", "zai-org/glm-5.2-maas", ...):
+        return "vertex_ai/openai/zai-org/glm-5.2-maas"
+    return model_id
+```
+
+This means you can set `MANTIS_MODEL=gemini-3.7-flash` and the implementation will route to `vertex_ai/gemini-3.7-flash` automatically if `VERTEXAI_PROJECT` is set. To force Google AI Studio routing, set `GEMINI_API_KEY` explicitly.
+
+## Configuring Models with configure.py
+
+Use the `--model` flag to set the default model for all nodes in `workflow.json`:
+
+```bash
+# Use Gemini Flash (routes to Vertex AI or AI Studio depending on env)
+python3 reference/scripts/configure.py --model gemini-3.7-flash
+
+# Use Claude via Vertex AI Model Garden
+python3 reference/scripts/configure.py --model vertex_ai/claude-opus-5
+
+# Use a custom OpenAI-compatible local server
+python3 reference/scripts/configure.py \
+    --model openai/my-local-model \
+    --api-base http://localhost:8000/v1
+
+# Update all nodes to use the specified model
+python3 reference/scripts/configure.py \
+    --model gemini-3.7-flash \
+    --update-nodes
+
+# Set reasoning effort and timeout
+python3 reference/scripts/configure.py \
+    --model gemini-3.7-flash \
+    --reasoning-effort high \
+    --timeout 180
+```
+
+<Note>
+  `configure.py` writes model changes to `workflow.local.json` by default, keeping your `workflow.json` template clean. Use `--save-tracked` / `--global` to write directly to `workflow.json` instead.
+</Note>
+
+## Custom OpenAI-Compatible Endpoints
+
+Any OpenAI-compatible server (vLLM, Ollama, LiteLLM proxy) can be used by setting the `openai/` prefix and an `api-base`:
+
+```bash
+# In workflow.json
+{
+  "config": {
+    "default_model": "openai/my-model",
+    "api_base": "http://localhost:8000/v1"
+  }
+}
+```
+
+Or via environment variables:
+
+```bash
+export MANTIS_MODEL="openai/mistral-7b-instruct"
+export LLM_API_BASE="http://localhost:11434/v1"
+```
+
+For Vertex AI-hosted OpenAI-compatible endpoints (e.g., GLM-5.2-MaaS), use the `vertex_ai/openai/` prefix:
+
+```bash
+export MANTIS_MODEL="vertex_ai/openai/zai-org/glm-5.2-maas"
+```

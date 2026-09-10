@@ -1,0 +1,249 @@
+---
+title: "Install and Configure Mantis Prerequisites"
+sidebarTitle: "Installation"
+description: "Set up Docker, gVisor sandbox isolation, cloud SDKs, and Mantis skills — plus the ADK reference implementation for production harness deployments."
+---
+
+Mantis itself is a set of `SKILL.md` prompt files installed into your coding agent — there is no binary to compile or service to run. What does require installation is the surrounding infrastructure: a container runtime for sandboxed code execution, an optional gVisor kernel-level isolation layer, and optionally the Google ADK reference harness if you want a production-grade programmatic pipeline. This page covers every prerequisite and the exact configuration values to use.
+
+<Warning>
+  Run Mantis **only** in an isolated environment. Never install or run it on a machine with access to production systems, sensitive data, or internal networks. The `/mantis-reproduce` and `/mantis-patch` stages will attempt to execute AI-generated code — always inside a sandbox, but AI agents are non-deterministic and may occasionally attempt unsafe actions if the local environment allows it.
+</Warning>
+
+## 1. Docker
+
+Mantis uses Docker (or a compatible OCI runtime) to execute proof-of-concept crash reproducers and patch verification scripts inside isolated containers. Install Docker Engine for your platform using the official instructions:
+
+- [Install Docker Engine on Linux](https://docs.docker.com/engine/install/)
+- [Install Docker Desktop for macOS](https://docs.docker.com/desktop/install/mac-install/)
+
+<Note>
+  macOS does not support MicroVM / KVM hardware virtualization. Dynamic reproduction requires a container runtime on macOS, or set the sandbox type to `static-only` for static-only analysis. Native Windows is not supported — use WSL2 instead.
+</Note>
+
+After installing Docker, verify it is running:
+
+```bash
+docker info
+```
+
+## 2. gVisor (`runsc`)
+
+gVisor is a user-space kernel that intercepts and sandboxes container syscalls, providing strong isolation for untrusted AI-generated code. It is the recommended sandbox backend for the `/mantis-reproduce` and `/mantis-patch` stages.
+
+### Install gVisor
+
+Follow the [gVisor installation guide](https://gvisor.dev/docs/user_guide/install/) for your Linux distribution. After installation, verify the binary is on your `PATH`:
+
+```bash
+runsc --version
+```
+
+### Register `runsc` with Docker
+
+You have two options: a one-line command or a manual daemon configuration.
+
+<Tabs>
+  <Tab title="Quick Command">
+    Register `runsc` with networkless execution and restart Docker in a single step:
+
+    ```bash
+    sudo runsc install -- --network=none && sudo systemctl restart docker
+    ```
+  </Tab>
+  <Tab title="daemon.json">
+    Add the `runsc` runtime block to `/etc/docker/daemon.json`. If the file does not exist, create it. If it already has content, merge the `"runtimes"` key into the existing JSON object.
+
+    ```json
+    {
+      "runtimes": {
+        "runsc": {
+          "path": "runsc",
+          "runtimeArgs": [
+            "--network=none"
+          ]
+        }
+      }
+    }
+    ```
+
+    Then restart Docker to apply the change:
+
+    ```bash
+    sudo systemctl restart docker
+    ```
+  </Tab>
+</Tabs>
+
+Verify the runtime is registered:
+
+```bash
+docker info | grep -A2 Runtimes
+```
+
+You should see `runsc` listed alongside the default `runc` runtime.
+
+<Note>
+  The `--network=none` argument ensures that all containers started by the `runsc` runtime have no network access. This is a critical safety constraint — the `/mantis-reproduce` skill is explicitly instructed to execute payloads inside networkless containers, and this configuration enforces that at the runtime level even if the agent makes a mistake.
+</Note>
+
+## 3. Cloud SDKs (for GCE Sandbox)
+
+If you plan to use the `gce` sandbox type — which runs each proof-of-concept inside a hardened, ephemeral Google Compute Engine VM — install the Google Cloud CLI:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install google-cloud-cli
+
+# Or follow the official guide:
+# https://cloud.google.com/sdk/docs/install
+```
+
+Authenticate and set your project:
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+```
+
+The GCE environment uses a private VPC with no external internet access, DNS blackholing, IAP tunneling, and IAM token suppression. Full hardening requirements for unattended cloud deployment are covered in the [GCE Deployment guide](/guides/unattended-gce-deployment).
+
+## 4. Installing the Mantis Skills
+
+The Mantis skills are slash-command definitions installed into your coding agent. You can install them globally (available across all projects) or locally (scoped to a single workspace).
+
+### Via `npx` (Recommended)
+
+```shell
+npx skills add google/mantis
+```
+
+This is the standard installation path for supported coding agents. Run it from your terminal and the skills will be registered automatically.
+
+### Via Git Clone
+
+Clone the repository and tell your coding agent to use the skills from the local directory:
+
+```bash
+git clone https://github.com/google/mantis.git
+cd your-project
+# Ask your coding agent: "Use the Mantis skills from ../mantis/ to review this codebase"
+```
+
+Your coding agent can guide you through configuring the local path.
+
+<Tip>
+  You can install globally to share skills across all your projects, or install locally per-workspace to pin a specific version of the skill definitions. For team environments, pinning a specific commit of the skills repository helps ensure consistent pipeline behavior.
+</Tip>
+
+## 5. ADK Reference Implementation
+
+The `reference/` directory in the Mantis repository contains a production-grade harness built on the Google Agent Development Kit (ADK). Use this if you want a programmatic, deterministic pipeline rather than interactive slash-command sessions.
+
+### Python Dependencies
+
+The ADK reference implementation requires Python 3.10+ and the following packages, specified in `reference/requirements.in`:
+
+```text
+google-adk==2.7.0
+litellm>=1.96.2
+pydantic>=2.4.0
+microsandbox==0.6.8
+pyyaml>=6.0.2
+```
+
+<Accordion title="What each dependency does">
+  <ParamField path="google-adk" type="==2.7.0">
+    The Google Agent Development Kit. Provides the `Workflow`, `Agent`, and `Classifier` constructs that the reference harness compiles the 16-stage Mantis pipeline into.
+  </ParamField>
+  <ParamField path="litellm" type=">=1.96.2">
+    A unified LLM provider interface. Allows the reference harness to route requests to Gemini, Vertex AI, or other model backends through a single API surface.
+  </ParamField>
+  <ParamField path="pydantic" type=">=2.4.0">
+    Data validation library used for schema enforcement. The `scripts/generate_schemas.py` tool compiles `schema.json` into Pydantic models at `core/schemas.py`.
+  </ParamField>
+  <ParamField path="microsandbox" type="==0.6.8">
+    In-process hardware MicroVM isolation via `libkrun`. Provides the `microsandbox` sandbox type (`Network.none()`) as an alternative to gVisor for dynamic reproduction.
+  </ParamField>
+  <ParamField path="pyyaml" type=">=6.0.2">
+    YAML parsing for skill frontmatter and configuration overlays.
+  </ParamField>
+</Accordion>
+
+### Installation
+
+From the `reference/` directory, run the provided install script:
+
+```bash
+cd reference/
+./install.sh
+```
+
+The script:
+
+1. Detects your platform (Linux, macOS, WSL2 — native Windows is not supported)
+2. Creates a Python virtual environment at `reference/.venv/`
+3. Installs all dependencies from `requirements.txt` with `--require-hashes` to enforce supply-chain integrity
+4. Attempts to build the `mantis-sandbox:latest` Docker image needed for dynamic reproduction, trying `buildah`, `podman`, and `docker` in order
+
+<Note>
+  If no container builder is found or the build fails, the install script will warn you but continue. You can still run static-only analysis by setting `sandbox.type` to `"static-only"` in `workflow.json`. Re-run `./install.sh` after installing a container builder to enable dynamic reproduction.
+</Note>
+
+### Configuration
+
+The reference harness uses a two-file layered configuration:
+
+<Tabs>
+  <Tab title="Auto-Configuration">
+    Run the configure script to auto-detect your environment and generate a local configuration overlay:
+
+    ```bash
+    cd reference/
+    source .venv/bin/activate
+    python scripts/configure.py --auto
+    ```
+
+    This writes resolved settings (GCP project ID, active sandbox type, model choices) to `workflow.local.json`, which is gitignored to keep your developer tree clean.
+  </Tab>
+  <Tab title="Manual Configuration">
+    The tracked `workflow.json` contains clean template values (e.g., `YOUR_PROJECT_ID`). Copy it to `workflow.local.json` and edit directly:
+
+    ```bash
+    cp reference/workflow.json reference/workflow.local.json
+    # Edit workflow.local.json with your actual values
+    ```
+
+    The local overlay is merged over the base config at runtime — any key in `workflow.local.json` overrides the corresponding key in `workflow.json`.
+  </Tab>
+</Tabs>
+
+### Running the Reference Harness
+
+Once configured, launch the pipeline:
+
+```bash
+cd reference/
+./run.sh
+```
+
+The `run.sh` script invokes `scripts/launch.py`, which validates the environment, performs preflight checks, and begins executing the 16-stage pipeline with automatic sandbox downgrade fallback if your configured sandbox is unavailable.
+
+## Sandbox Types Summary
+
+The reference harness supports four pluggable sandbox backends. Choose based on your environment and security requirements:
+
+<CardGroup cols={2}>
+  <Card title="static-only" icon="lock">
+    Safe static analysis only. Dynamic crash reproduction and patch verification are skipped entirely. Use this on macOS or in any environment without a container runtime.
+  </Card>
+  <Card title="gvisor" icon="shield">
+    OCI container isolation via Docker/Podman and gVisor `runsc` with `--network=none`. Recommended for Linux environments. Requires the daemon.json configuration above.
+  </Card>
+  <Card title="microsandbox" icon="microchip">
+    In-process hardware MicroVM isolation via `libkrun` and `Network.none()`. An alternative to gVisor — installed automatically by `install.sh` as part of the `microsandbox` Python package.
+  </Card>
+  <Card title="gce" icon="cloud">
+    Hardened ephemeral Google Compute Engine VM isolation in a private non-internet VPC. Required for unattended 24/7 operation. See the [GCE Deployment guide](/guides/unattended-gce-deployment) for full setup.
+  </Card>
+</CardGroup>

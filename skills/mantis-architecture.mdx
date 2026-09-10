@@ -1,0 +1,126 @@
+---
+title: "/mantis-architecture: Codebase Knowledge Base Synthesizer"
+sidebarTitle: "/mantis-architecture"
+description: "Translates raw learnings and codebase analysis into an interlinked Markdown Knowledge Base covering architecture, entities, and vulnerability patterns."
+---
+
+The `/mantis-architecture` skill synthesizes two inputs — the raw insights queue (`workspace/learnings.jsonl`) and live source code — into a permanent, interlinked Markdown Knowledge Base under `workspace/kb/`. It defines system architecture, maps individual components as entities, and catalogs historical vulnerability patterns. Run it at the beginning of each loop pass to build or update the KB before threat modeling and planning. Do not use it to generate threat models or formulate execution plans — those are the responsibilities of `/mantis-threat-model` and `/mantis-plan`.
+
+## Command
+
+```
+/mantis-architecture [--snapshot_root <dir>] [--snapshot_id <id>]
+                     [--state_root <dir>] [--target_root <dir>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Absolute path to the pinned, read-only code snapshot. Source is read under this directory (`CODE_ROOT`).
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The `SNAPSHOT_ID` of this pass. Stamped as a `<!-- KB_SNAPSHOT: <id> -->` marker on every (re)written KB file in HALT and PINNED modes.
+</ParamField>
+
+<ParamField path="--state_root" type="string" optional>
+  Parent directory of `workspace/`. All KB files, archives, and state are written STATE-RELATIVE — never under `CODE_ROOT`. When absent, defaults to `./workspace/` (MODE-OFF / today's behavior).
+</ParamField>
+
+<ParamField path="--target_root" type="string" optional>
+  Authoritative override for `CODE_ROOT`. Used when a caller passes a prepared tree (e.g., a patched shadow). Overrides `--snapshot_root` and the state fallback.
+</ParamField>
+
+<Note>
+  **All flags absent → MODE-OFF.** The skill performs a best-effort build/update against `CODE_ROOT` (current directory), does not prepend any STALE banner, and does not stamp `kb_snapshot_id`. This is byte-for-byte today's default behavior.
+</Note>
+
+## Input / Output Contract
+
+### Reads
+
+| Path | Purpose |
+|------|---------|
+| `workspace/learnings.jsonl` | Raw insights, vulnerabilities, and trajectory findings from the current round (**required**) |
+| `workspace/historical_learnings.jsonl` | Past vulnerability metadata (optional) |
+| `CODE_ROOT` source files and directory structure | Codebase architecture, component boundaries, trust surfaces |
+| `workspace/kb/*.md` and `workspace/kb/entities/` | Existing KB entries for decay validation |
+| `workspace/.mantis_state.json` | Pass number, `active_snapshot`, `kb_snapshot_id`, `changed_files` |
+
+### Writes
+
+| Path | Content |
+|------|---------|
+| `workspace/kb/architecture.md` | High-level data flows, zone definitions, system design |
+| `workspace/kb/entities/<component>.md` | Per-component security definitions, constraints, and criticality |
+| `workspace/kb/vulnerabilities/<CWE-or-class>.md` | Bug class descriptions historically relevant to this codebase |
+| `workspace/kb/index.md` | Root catalog with links and one-line summaries to all KB files |
+| `workspace/kb/dependencies.json` | Import/dependency edges extracted from architecture analysis |
+| `workspace/archive/learnings/learnings_pass_N_X.jsonl` | Archived learnings after successful synthesis |
+| `workspace/archive/kb/kb_pass_N_X/` | Immutable per-pass copy of the entire KB tree |
+
+## KB Structure
+
+```
+workspace/kb/
+├── index.md                        # Root catalog (planner reads this)
+├── architecture.md                 # Data flows, zones, system design
+├── dependencies.json               # Import/dependency graph for fan-out
+├── THREAT_MODEL.md                 # Written by /mantis-threat-model
+├── entities/
+│   ├── auth_module.md
+│   ├── network_handler.md
+│   └── ...
+└── vulnerabilities/
+    ├── CWE-787.md
+    ├── Memory-Corruption.md
+    └── ...
+```
+
+## Usage
+
+### Standalone invocation (MODE-OFF)
+
+```bash
+/mantis-architecture
+```
+
+### With snapshot and state root (orchestrated)
+
+```bash
+/mantis-architecture \
+  --snapshot_root /tmp/mantis/snapshots/snap_abc \
+  --snapshot_id snap_abc \
+  --state_root /tmp/mantis/state
+```
+
+## Notes
+
+<Accordion title="KB snapshot freshness gate">
+  In HALT and PINNED modes, the skill runs a mechanical freshness check before building or updating:
+
+  | Outcome | Condition | Action |
+  |---------|-----------|--------|
+  | **STALE / HALT** | `snapshot_pinned` is false | Best-effort update; prepend STALE banner to `index.md`; set `kb_snapshot_id = CUR` |
+  | **CURRENT** | `KB_ID == CUR` (both non-empty) | Incremental update + decay check; re-stamp `KB_SNAPSHOT: CUR`; remove any STALE banner |
+  | **BUILD FRESH (scoped)** | Pinned AND KB has a stamp AND `changed_files_pass` matches current pass | Rebuild only KB entries for changed files plus 2-hop dependents |
+  | **BUILD FRESH (full)** | Pinned AND (no prior KB, OR `changed_files_status` is UNKNOWN, OR guardrail fired) | Rebuild every KB file from scratch |
+
+  The freshness gate is **skipped entirely in MODE-OFF** — the skill performs a best-effort update and does not prepend a STALE banner.
+</Accordion>
+
+<Accordion title="Transactional inbox clearing">
+  Synthesis is **transactional**: `workspace/learnings.jsonl` is moved to the archive only after all KB Markdown updates are programmatically verified as successfully written. If synthesis fails or is interrupted, the learnings file is left intact. This prevents infinite loops (re-processing the same learnings) and token bloat across passes.
+
+  Archive naming: `workspace/archive/learnings/learnings_pass_N_X.jsonl` where `N` = current pass number and `X` = sub-index (count of existing files matching `learnings_pass_N_*` + 1).
+</Accordion>
+
+<Accordion title="Decay validation">
+  Before finalizing KB updates, the skill spot-checks existing `workspace/kb/entities/` assertions against the current source under `CODE_ROOT`. If an entity claims a variable is un-sanitized but the code now contains a sanitization function (due to a landed patch), the outdated assertion is deleted or corrected. In the BUILD FRESH outcome, all prior assertions are discarded and re-derived from scratch — no spot-check needed.
+</Accordion>
+
+<Accordion title="Per-pass KB archive">
+  After every successful synthesis, the entire `workspace/kb/` tree is copied to `workspace/archive/kb/kb_pass_N_X/`. This immutable per-pass snapshot ensures that a later reverted fix cannot silently erase the record of what the KB asserted at pass N. The live `workspace/kb/` is never moved — only copied.
+</Accordion>
+
+<Accordion title="Snapshot stamping rules">
+  Every (re)written KB file gets `<!-- KB_SNAPSHOT: <SNAPSHOT_ID> -->` as its **first line** in HALT and PINNED modes. This is an HTML comment and does not render in Markdown viewers. The next pass's freshness gate reads this marker to detect drift. In MODE-OFF, the marker is **not** written — it is a snapshot-era artifact that only applies when `active_snapshot` is present.
+</Accordion>

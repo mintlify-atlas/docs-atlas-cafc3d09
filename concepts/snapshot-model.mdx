@@ -1,0 +1,174 @@
+---
+title: "Snapshot Model for Continuous Security Codebase Reviews"
+sidebarTitle: "Snapshot Model"
+description: "How Mantis's opt-in snapshot-per-pass model pins immutable codebase copies, stamps findings to their snapshot, and syncs living codebases safely."
+---
+
+By default, Mantis performs a point-in-time review of whatever code is currently on disk — a single static pass that is complete and correct for the moment it runs. For teams that run Mantis continuously against a living codebase, this default creates a subtle problem: code can change mid-pass, which shifts line numbers, breaks reproducers, and corrupts patches before the next stage even starts. The snapshot model solves this by pinning an immutable copy of the codebase at the start of each pass and ensuring that every stage reads exclusively from that pinned copy. It is **opt-in and default off** — without the `--sync` flag or snapshot arguments, the pipeline behaves byte-for-byte as before.
+
+## The Three Operating Modes
+
+The snapshot model defines three distinct operating modes based on the presence and state of `active_snapshot` in `workspace/.mantis_state.json`:
+
+<Tabs>
+  <Tab title="MODE-OFF (default)">
+    **Trigger:** `active_snapshot` is absent from `workspace/.mantis_state.json` — no `--sync` flag was passed and no snapshot arguments were provided.
+
+    **Behavior:** Byte-for-byte today's behavior. Each stage reads the current working directory directly. Mid-run edits are not frozen. No snapshot is pinned. All verdicts are permitted (`VERIFIED_SECURE`, `failed_to_reproduce`, `DUPLICATE`, `FALSE_POSITIVE`, `NON_VIABLE` are all emittable). Every snapshot match check reports "not matched" (nothing to compare against), but this never blocks the pipeline.
+
+    **When to use:** Interactive manual use, one-time point-in-time reviews, development and experimentation. This is the default for every interactive CLI session.
+  </Tab>
+  <Tab title="PINNED (opt-in)">
+    **Trigger:** `active_snapshot` is present with `snapshot_pinned: true` — `--sync` was passed and the orchestrator successfully pinned an immutable copy.
+
+    **Behavior:** Every stage reads the target through the pinned snapshot root (`--snapshot_root`). Edits to the live tree during a pass are invisible to all stages. Findings are stamped with the snapshot ID. Deduplication, false-positive filtering, and VERIFIED_SECURE verdicts only apply when `discovery_commit` exactly matches the current `snapshot_id`. New code is picked up at the next pass boundary.
+
+    **When to use:** Continuous unattended operation, CI/CD integration, long-running reviews of active repositories.
+  </Tab>
+  <Tab title="HALT (degraded)">
+    **Trigger:** `active_snapshot` is present with `snapshot_pinned: false` — `--sync` was requested but the snapshot could not be pinned (live endpoint, tree too large to copy, copy failure, dirty/racing tree, or detached HEAD).
+
+    **Behavior:** Stages do not stop, but run degraded. Results are non-authoritative. The HALT ceiling prevents authoritative verdicts: `VERIFIED_SECURE` is replaced by `VERIFICATION_INCOMPLETE`, and `failed_to_reproduce` is replaced by `not_attempted`. Every snapshot match check returns NOT_MATCHED.
+
+    **When to use:** This mode is entered automatically when `--sync` is requested but pinning fails. Live endpoints and uncopyable targets always run in HALT mode when `--sync` is active.
+  </Tab>
+</Tabs>
+
+## How a Pass Lifecycle Works
+
+A conformant harness implements the following sequence for each pass when the snapshot model is enabled:
+
+<Steps>
+  <Step title="Sync (opt-in, first action only)">
+    When `--sync` is passed, sync is the **very first action** of a pass — never mid-pass. Sync only runs when `workspace/findings/` is empty (the previous pass has been archived). This ensures no in-flight finding is stranded across a code change.
+
+    Sync is strictly non-destructive and fast-forward only:
+    - `git fetch && git merge --ff-only`
+    - `hg pull && hg update --check`
+    - `repo sync -c`
+
+    Sync is **skipped entirely** if the tree is dirty, ahead of upstream, on a detached HEAD, or has no upstream configured. It never runs `git reset --hard`, `git checkout -- .`, `git clean`, or anything that discards local work. Any sync failure keeps the current tree and proceeds.
+  </Step>
+  <Step title="Detect VCS and compute SNAPSHOT_ID">
+    After sync (or immediately, if sync was skipped), the orchestrator detects the VCS type and computes the `SNAPSHOT_ID` for this pass using the ladder defined below. This value is computed **once per pass** and then only read — never recomputed mid-pass.
+  </Step>
+  <Step title="Pin an immutable snapshot copy">
+    The orchestrator materializes an isolated, read-only copy of the target:
+    - **Clean git/hg tree:** `git worktree` or `hg archive` — fast and storage-efficient
+    - **Dirty or no-VCS tree:** Full recursive copy of the working directory
+
+    The copy is placed under `.mantis_snapshots/` (never under `workspace/`). A sentinel file `.mantis_snapshot_id` containing the `SNAPSHOT_ID` is written into the root of the copy. If the copy fails (insufficient disk space, permissions, live endpoint), `snapshot_pinned` is set to `false` and the pass enters HALT mode.
+  </Step>
+  <Step title="Record state">
+    The orchestrator writes `active_snapshot` to `workspace/.mantis_state.json` (with `root`, `snapshot_id`, `snapshot_pinned`, `pass`, and `vcs_type`) and **appends** exactly one entry to `snapshot_history`. Prior `snapshot_history` entries are never overwritten — the array is append-only and serves as the audit log for cross-pass changed-file diffing.
+  </Step>
+  <Step title="Run all stages with snapshot flags">
+    Every stage is invoked with three additional flags:
+    - `--snapshot_root=<path to pinned copy>` — stages read target code through this root
+    - `--snapshot_id=<SNAPSHOT_ID>` — used for snapshot match checks
+    - `--state_root=<workspace parent>` — locates `workspace/.mantis_state.json`
+
+    Stages that receive a `--target_root` override (e.g., the patched shadow during re-attack) use that instead of `--snapshot_root`.
+  </Step>
+  <Step title="Archive findings and increment pass">
+    After `/mantis-report` completes, the harness archives `workspace/findings/` to `workspace/archive/findings_pass_<N>/` and increments `pass_number` in `workspace/.mantis_state.json`. The next pass starts with an empty `workspace/findings/`, which is the prerequisite for sync.
+  </Step>
+</Steps>
+
+## The SNAPSHOT_ID Ladder
+
+The `SNAPSHOT_ID` uniquely identifies the exact bytes a pass analyzed. It is computed once per pass using this ladder, in priority order:
+
+<Accordion title="Full SNAPSHOT_ID ladder with examples">
+  | Condition | SNAPSHOT_ID format | Example |
+  |---|---|---|
+  | Clean git or hg tree | `commit_hash` | `abc123def456789` |
+  | Dirty git or hg tree | `commit_hash:content_hash` | `abc123def456:sha256a1b2c3d4` |
+  | Multi-VCS (`.repo` manifest) | `revision:content_hash` | `main:sha256e5f6a7b8` |
+  | No VCS / unknown, copyable tree | `content:<content_hash>` | `content:sha256c9d0e1f2` |
+  | Single binary or firmware artifact | `sha256:<artifact_hash>` | `sha256:a3b4c5d6e7f8` |
+  | Live endpoint / uncopyable / copy failed | `live:<ISO8601 timestamp>` | `live:2025-01-15T10:23:45Z` |
+
+  `content_hash` is a SHA-256 computed over **every** file in the pinned copy (never a partial hash). The dirty, no-VCS, and multi-VCS tiers embed this content hash so that an **unchanged** dirty or no-VCS tree produces the **same** SNAPSHOT_ID across passes — enabling deduplication and false-positive filtering even without a clean VCS history. A tree that actually changed produces a different SNAPSHOT_ID.
+
+  A bare multi-VCS manifest revision (e.g., a branch name like `main`) **must never** be trusted for equality on its own — only the `revision:content_hash` form is reliable.
+</Accordion>
+
+<Warning>
+The `live:<ISO8601>` tier always sets `snapshot_pinned: false` because live endpoints cannot be pinned to an immutable copy. Passes against live endpoints run in HALT mode by design.
+</Warning>
+
+## How Findings Are Pinned to Their Snapshot
+
+Each finding in `workspace/findings/<uuid>.json` carries a `discovery_commit` field — the SNAPSHOT_ID of the snapshot the finding was first discovered against. This field is written once by `/mantis-researcher` at creation and preserved verbatim across every retry, archival, and exploit-chain re-use.
+
+`discovery_commit` is the trust anchor for the **Snapshot Match Check**: a downstream stage trusts a prior verdict on a finding **only** when `discovery_commit` is present and **exactly equals** the current pass's `SNAPSHOT_ID` (byte-for-byte, no fuzzy comparison).
+
+When the match check fails:
+- **Deduplication:** A finding with a different `discovery_commit` is never silently marked `DUPLICATE`. Instead, a `possible_duplicate_of` advisory pointer is set — a non-destructive hint that lets the finding remain active in case the earlier finding was a regression.
+- **Reproduction and patching:** A finding with a mismatched or absent `discovery_commit` is re-researched and re-verified rather than trusted.
+- **Chain findings:** When constituent findings span different snapshots, `discovery_commit` is set to the literal string `MIXED`, which is treated as NOT_MATCHED.
+
+```json title="Finding with discovery_commit"
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "title": "SQL Injection in user search endpoint",
+  "discovery_commit": "abc123def456789",
+  "status": "VALID",
+  ...
+}
+```
+
+<Note>
+`discovery_commit` is optional and backward-compatible. Absent or null values (legacy findings, or findings from a MODE-OFF or HALT pass) are treated as NOT_MATCHED — the finding is re-researched and never silently trusted. This is the safe branch.
+</Note>
+
+## Boundary Sync Conditions
+
+The sync step only runs when **all** of the following conditions are met:
+
+| Condition | Requirement |
+|---|---|
+| `--sync` flag | Must be explicitly passed to `/mantis-meta-agent` |
+| `workspace/findings/` | Must be empty (previous pass archived) |
+| Working tree | Must be clean (no uncommitted changes) |
+| HEAD | Must not be detached |
+| Upstream | Must be configured |
+| Merge strategy | Must be fast-forward only; any conflict aborts sync |
+
+If any condition is not met, sync is **skipped entirely** and the pass continues with the current tree. The pipeline never deadlocks waiting for sync conditions to be satisfied.
+
+After a successful sync, the Knowledge Base and directory summaries built against the previous snapshot are stale and **must be force-refreshed** by re-running `/mantis-architecture` before planning the new pass. The `kb_snapshot_id` field in `workspace/.mantis_state.json` records the snapshot the KB was last built against, making it easy to detect staleness.
+
+## Enabling the Snapshot Model: `--sync` with `/mantis-meta-agent`
+
+To enable continuous pinned-snapshot operation, pass `--sync` when invoking `/mantis-meta-agent`:
+
+```text
+/mantis-meta-agent --sync
+```
+
+By default, the `state_root` (the parent directory of `workspace/`) is the current working directory (typically the target repo root). If `workspace/` is colocated inside the target repository, pass a `--state_root` pointing outside the target to avoid the colocated-state hazard where the workspace itself appears in the pinned snapshot:
+
+```text
+/mantis-meta-agent --sync --state_root=/home/user/mantis-state/
+```
+
+<Warning>
+When `workspace/` is colocated inside the target repository and you use `--sync`, set `--state_root` to a path **outside** the target. Otherwise the workspace files (findings, KB, reports) will be included in the pinned snapshot's content hash, causing every pass to produce a different SNAPSHOT_ID even when the actual source code hasn't changed.
+</Warning>
+
+## Backward Compatibility Guarantee
+
+Every field introduced for the snapshot model is optional. Existing workspaces and pre-snapshot findings validate unchanged against the current `schema.json`. No new `required` field or `allOf` gate was added. The backward-compatibility rules are:
+
+| Field | Absent means |
+|---|---|
+| `active_snapshot` | MODE-OFF — byte-for-byte today's behavior, all verdicts permitted |
+| `discovery_commit` | NOT_MATCHED — re-research, never silently trust any prior verdict |
+| `snapshot_history` previous entry | No cross-pass diff — treat all files as changed |
+| `repro_status` reached-sink evidence | `not_attempted`, never a negative verdict |
+| `signature` | Fall back to UUID-based deduplication |
+| `lineage_id` | Fall back to `id` (UUID) for finding identity |
+
+A harness that does not implement the snapshot lifecycle simply leaves `snapshot_pinned` unset and gets today's single-static-snapshot behavior exactly.

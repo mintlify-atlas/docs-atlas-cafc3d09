@@ -1,0 +1,127 @@
+---
+title: "/mantis-reflect: Execution Trajectory Analyzer"
+sidebarTitle: "/mantis-reflect"
+description: "Parses execution transcripts at round end, extracting false assumptions and tool failures into workspace/learnings.jsonl to sharpen future pipeline passes."
+---
+
+The `/mantis-reflect` skill is the learning and memory layer of the Mantis pipeline. After each round of stage execution, it reads the raw execution transcripts of every subagent that ran — researchers, reproducers, patchers, calibrators, and more — and distills what succeeded, what failed, and what false assumptions were made. These insights are appended to `workspace/learnings.jsonl`, which feeds forward into the next pass's architecture synthesis and planning stages. Use this skill at the end of every pipeline round. Do not use it to analyze source code or write patches; it is a **findings-only** stage that reads agent conversation logs, not target code.
+
+## Command
+
+```text
+/mantis-reflect
+```
+
+This skill takes no positional arguments. It receives the list of transcript file paths from the orchestrator at invocation time.
+
+## Input / Output Contract
+
+**Reads:**
+
+| Path | Purpose |
+|---|---|
+| `workspace/.mantis_state.json` | Current `pass_number` and `active_snapshot.snapshot_id` for provenance stamping |
+| `<transcript paths>` (passed by orchestrator) | Execution log files (`transcript.jsonl`) for each subagent stage that ran this round |
+
+<Note>
+The orchestrator **must** pass the absolute file paths to all execution logs when invoking this skill. Reflector does not hardcode any specific framework's log layout. If no paths are passed and no logs can be located, the skill records a missing-transcript insight rather than silently producing zero output.
+</Note>
+
+**Writes:**
+
+| Path | Purpose |
+|---|---|
+| `workspace/learnings.jsonl` | Appended (never overwritten) with one structured `trajectory_insight` JSON object per distinct insight |
+
+**Preconditions:** Execution logs for the current round should exist. Missing or unreadable logs are not fatal — the skill records them as gap insights.
+
+**Idempotency:** The skill deduplicates on `target_entity + insight + source_stage` (treating `snapshot` as attached metadata, not identity). Re-running within the same pass does not produce duplicate entries.
+
+## Instruction Flow
+
+<Steps>
+  <Step title="Locate transcripts">
+    Use the absolute log file paths provided by the orchestrator. Do not read entire `transcript.jsonl` files natively — instead, write and run a short Python or shell script to extract only the key events (tool errors, agent summaries, give-up signals, trust boundary failures). This avoids blowing out the context window on large log files.
+
+    For each stage that ran this round whose transcript is **missing, unreadable, empty, or yields zero parseable entries**, immediately append one `trajectory_insight` naming the stage and the reason (e.g., `"no transcript file at <path>"`, `"empty log"`, `"0 parseable entries"`). This ensures even a fully empty round produces auditable output.
+  </Step>
+  <Step title="Synthesize insights">
+    Review extracted events and look for three classes of signals:
+
+    - **False Assumptions:** A researcher spent multiple turns trying to exploit a parameter only to find it was sanitized upstream in a different file.
+    - **Tool Failures:** The reproducer consistently failed because a library was missing from the sandbox environment.
+    - **Successful Strategies:** A patcher fixed a bug using a specific idiomatic pattern that should be reused in future passes.
+  </Step>
+  <Step title="Append to learnings inbox">
+    For each distinct insight, append a structured JSON object to `workspace/learnings.jsonl`. The file is append-only — never overwrite it.
+
+    Read `active_snapshot.snapshot_id` from `workspace/.mantis_state.json` (state-relative, never from a live VCS command) and set the `snapshot` field on every emitted insight. If `active_snapshot` is absent, omit the `snapshot` field entirely — never fabricate an ID.
+  </Step>
+</Steps>
+
+## Output Schema
+
+Each line appended to `workspace/learnings.jsonl` is a JSON object:
+
+```json
+{
+  "type": "trajectory_insight",
+  "action": "add",
+  "target_entity": "auth_module.py",
+  "insight": "The researcher assumed input was unsanitized, but it is actually cleansed by the middleware layer in request_handler.py. Do not attempt XSS on the 'name' parameter.",
+  "source_stage": "mantis-researcher",
+  "snapshot": "content:9f86d081884c7d659a2feaa0c55ad015a3bf4f1767858a36821834bea"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `type` | Yes | Always `"trajectory_insight"` |
+| `action` | Yes | `"add"`, `"update"`, or `"remove"` |
+| `target_entity` | Yes | The file, module, or system component the insight concerns |
+| `insight` | Yes | The actionable learning text |
+| `source_stage` | Yes | The stage name where the event was observed (e.g., `"mantis-researcher"`) |
+| `snapshot` | No | `active_snapshot.snapshot_id` from state; **omitted entirely** when absent |
+
+<Warning>
+The `snapshot` field must be read from `workspace/.mantis_state.json`. **Never run a live VCS command** (`git`, `hg`, `repo`) to derive it. If the state file is unreadable, omit `snapshot` entirely and proceed.
+</Warning>
+
+## Log Format Compatibility
+
+Reflector normalizes execution logs to the `execution_log_entry` schema defined in `schema.json`. If raw logs from unsupported frameworks are provided, the skill parses them on a best-effort basis. The `mantis-meta-agent` orchestrator resolves transcript paths differently per harness:
+
+- **Antigravity:** `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`
+- **Gemini CLI, Google ADK, Claude Code, custom pipelines:** Framework-specific locations resolved at invocation time
+
+When the active harness exposes no execution logs at all, the orchestrator should pass an **explicit empty list** and instruct Reflector to record a missing-transcript insight per stage.
+
+## Usage
+
+Reflector is invoked by the meta-agent as **Stage 13**, after calibrate and before the report stage:
+
+```text
+/mantis-reflect
+```
+
+When snapshot pinning is active, the meta-agent appends the standard roots:
+
+```text
+/mantis-reflect --snapshot_root=<active_snapshot.root> --snapshot_id=<active_snapshot.snapshot_id> --state_root=<workspace parent>
+```
+
+Reflector ignores `--snapshot_root` for code reading (it is a findings-only stage) but uses `--state_root` to locate `workspace/.mantis_state.json` and `workspace/learnings.jsonl`.
+
+## Notes
+
+<Note>
+**Stages covered:** Reflector analyzes every stage that ran in the current round — history, structural-index, summarize, architecture, threat-model, plan, researcher, dedupe, review, critic, reproduce, chain, patch, and calibrate. The orchestrator must provide transcript paths for all of them.
+</Note>
+
+<Note>
+**Deduplication identity:** Two insights are considered duplicates only if `target_entity`, `insight`, and `source_stage` all match. The `snapshot` field is treated as metadata, not identity, so a retry within the same pass will not double-append an insight.
+</Note>
+
+<Tip>
+The insights written to `workspace/learnings.jsonl` are consumed by the next pass's `@mantis-architecture` synthesis stage, which distills them into the permanent Knowledge Base. This creates a feedback loop that makes subsequent research passes more targeted and avoids known dead ends.
+</Tip>

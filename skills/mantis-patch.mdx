@@ -1,0 +1,304 @@
+---
+title: "/mantis-patch: Automated Security Patch Generator"
+sidebarTitle: "/mantis-patch"
+description: "Generate minimal security patches in transactional shadow isolation, verify them with a full unpatched-baseline gate, and confirm with independent ≥3-variant re-attack runs."
+---
+
+Once a vulnerability has been reproduced, `/mantis-patch` takes over: it reads
+the vulnerable source file, designs a minimal corrective change, applies it
+inside a transactionally isolated shadow copy of the codebase, and then runs a
+rigorous two-stage verification — first confirming the patch compiles and
+passes a benign control input, then spawning an independent `/mantis-reproduce
+--reattack` sub-agent that tests the patch with ≥ 3 boundary-mutated variant
+inputs. Only when all gates pass is a finding declared `VERIFIED_SECURE`. Use
+this skill on findings whose `repro_status` is `"reproduced"` or on exploit
+chains after all their constituent findings have been patched. Do not use it
+for initial vulnerability research or for generating reproduction payloads.
+
+## Command
+
+```
+/mantis-patch [--target_root=<path>] [--state_root=<path>]
+              [--snapshot_root=<path>] [--snapshot_id=<id>]
+              [--snapshot_pinned=<true|false>]
+```
+
+<ParamField path="--target_root" type="string" optional>
+  Root of the code snapshot to read (CODE_ROOT). Authoritative when supplied —
+  reserved for a caller that hands you an already-prepared tree.
+</ParamField>
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Root of the pinned immutable snapshot for this pass.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The SNAPSHOT_ID string of the pinned snapshot, used by the Snapshot Match Check.
+</ParamField>
+
+<ParamField path="--snapshot_pinned" type="boolean" optional>
+  `true` when a pinned immutable snapshot exists this pass; `false`/absent
+  enables degraded/legacy mode.
+</ParamField>
+
+<ParamField path="--state_root" type="string" default=".">
+  Root of the Mantis state directory containing `workspace/`. All
+  `workspace/...` paths resolve relative to this root.
+</ParamField>
+
+## Input / Output Contract
+
+<Tabs>
+  <Tab title="Reads">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/*.json` | Reproduced findings whose `patch_status` is not already `VERIFIED_SECURE` or `MITIGATION_PROPOSED` against the current snapshot |
+    | `workspace/.mantis_state.json` | Current `pass_number`, `active_snapshot`, `changed_files` |
+    | Target source files under `CODE_ROOT` | Files containing the vulnerable code |
+    | `workspace/findings/<id>.repro_file_path` | Path to the PoC script for verification |
+  </Tab>
+  <Tab title="Writes">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/<id>.json` | Updated: `patch_status`, `patch_diff`, `patch_base_snapshot`, `reattack_status`, `reattack_variants`, and a `patch` history entry |
+    | `workspace/learnings.jsonl` | Append-only long-term memory entry per processed finding |
+    | `workspace/helpers/append_patch.py` | Versioned helper script (`MANTIS_HELPER_VERSION = 2`) for token-efficient in-place updates |
+  </Tab>
+</Tabs>
+
+<Warning>
+  The patcher **never writes under `CODE_ROOT`** when the snapshot is pinned.
+  All edits, compilation, and reproduction testing happen inside a private
+  shadow copy (see Transactional Isolation below).
+</Warning>
+
+## Usage
+
+```
+/mantis-patch
+```
+
+Invoke without arguments (MODE-OFF) to patch all reproduced findings in the
+live workspace.
+
+**With a pinned snapshot:**
+
+```
+/mantis-patch \
+  --snapshot_root=/tmp/mantis_snapshots/pass_3 \
+  --snapshot_id=abc123def456 \
+  --state_root=/workspace
+```
+
+## Patch Status Values
+
+<CardGroup cols={2}>
+  <Card title="VERIFIED_SECURE" icon="shield-check">
+    All gates passed: unpatched baseline triggered, patched build compiled,
+    benign control passed, attack input blocked, and an independent re-attack
+    with ≥ 3 variants all failed to bypass.
+  </Card>
+  <Card title="MITIGATION_PROPOSED" icon="file-lines">
+    Applied to binary or firmware targets where no source code is available. A
+    high-level mitigation recommendation is provided instead of a code diff.
+    Also applied when `repro_status` is `statically_confirmed` (no runnable PoC
+    to verify against).
+  </Card>
+  <Card title="VERIFICATION_INCOMPLETE" icon="circle-question">
+    Post-patch verification passed but subsequent re-attack checks failed or
+    timed out due to infrastructure errors, sandbox restrictions, HALT mode, or
+    an insufficient variant set (fewer than 3 valid variants produced).
+  </Card>
+  <Card title="VERIFICATION_FAILED" icon="circle-xmark">
+    The sandbox still triggers the bug after patching, or the re-attack
+    sub-agent bypassed the patch with a valid variant.
+  </Card>
+</CardGroup>
+
+<Note>
+  In **HALT/DEGRADED mode** (`snapshot_pinned = false` with a `live:` SNAPSHOT_ID),
+  authoritative verdicts are forbidden. The best attainable `patch_status` is
+  `VERIFICATION_INCOMPLETE` — `VERIFIED_SECURE` is never emitted in this mode.
+</Note>
+
+## Transactional Shadow Isolation
+
+To ensure the original codebase is never left in a modified state, the patcher
+uses **Option A: Temporary Directory Shadowing** as the recommended (and
+mandatory-when-pinned) isolation method.
+
+<Steps>
+  <Step title="Create Shadow Root">
+    Create `SHADOW_ROOT` outside both `CODE_ROOT` and any `/workspace/` path
+    using `mktemp -d`. Copy the relevant source tree **from `CODE_ROOT`** (the
+    pinned snapshot) into `SHADOW_ROOT`. `CODE_ROOT` is never modified.
+  </Step>
+  <Step title="Edit Inside Shadow">
+    Read the original flawed file from `CODE_ROOT` to understand dependencies
+    and structures. Apply all code modifications exclusively inside `SHADOW_ROOT`.
+    Run all compilation and reproduction testing with `Cwd = SHADOW_ROOT`.
+  </Step>
+  <Step title="Generate Unified Diff">
+    Produce a unified diff comparing original files in `CODE_ROOT` with modified
+    files in `SHADOW_ROOT`. Use labels so no absolute path leaks into diff headers.
+  </Step>
+  <Step title="Run Verification and Re-Attack">
+    Execute Block G (unpatched baseline + post-patch gate) and spawn the
+    `@mantis-reproduce --reattack` sub-agent against the patched shadow.
+  </Step>
+  <Step title="Clean Up Shadow">
+    Delete `SHADOW_ROOT` completely (`rm -rf`). Since `CODE_ROOT` was never
+    modified, no further restoration is needed.
+  </Step>
+</Steps>
+
+<Tip>
+  **Option B (File-Level Backups)** is available as a fallback in LEGACY and
+  HALT mode for first-attempt findings when the source tree is very large.
+  It modifies files in place and requires an exclusive workspace lock
+  (`workspace/.workspace_edit.lock` via `fcntl.flock`). In PINNED mode,
+  Option B is **forbidden** — the snapshot is read-only.
+</Tip>
+
+## The VERIFIED_SECURE Gate
+
+Achieving `VERIFIED_SECURE` requires **all** of the following conditions:
+
+<Steps>
+  <Step title="Block G — Unpatched Baseline Triggers">
+    Run the reproducer against a **fresh unpatched copy** of `CODE_ROOT` (a new
+    `mktemp -d` copy). The bug must fire with **reached-sink evidence** present.
+    If evidence is absent or the bug does not trigger → `patch_status = "ERROR"`
+    (`reproducer_invalid_on_current_snapshot`). Never emit `VERIFIED_SECURE`
+    from a failed baseline.
+  </Step>
+  <Step title="Block G — Patched Build Compiles">
+    The patched build must compile with exit code 0 inside `SHADOW_ROOT`.
+    A non-zero exit → `VERIFICATION_INCOMPLETE`.
+  </Step>
+  <Step title="Block G — Benign Control Passes">
+    Run a legitimate benign (non-attack) input through the patched build. It
+    must **reach the sink path** (reached-sink evidence present via Block F)
+    with no crash. This proves the patch narrowed the bug rather than breaking
+    the entrypoint. If no benign control can be constructed → `VERIFICATION_INCOMPLETE`.
+  </Step>
+  <Step title="Block G — Attack Input Blocked">
+    Run the original attack input through the patched build. It must **not**
+    crash or trigger the vulnerability.
+  </Step>
+  <Step title="Re-Attack: ≥ 3 Variants All Fail to Bypass">
+    Spawn a fresh `@mantis-reproduce --reattack` sub-agent against the patched
+    shadow. It must write `reattack_status = "failed_to_bypass"` with a
+    non-empty `reattack_variants` array containing **≥ 3 valid variant inputs**
+    that all failed to trigger the original vulnerability class. An empty or
+    short variant set caps at `VERIFICATION_INCOMPLETE`.
+  </Step>
+</Steps>
+
+<Warning>
+  All runs in Block G — unpatched baseline, benign control, attack, and
+  re-attack — **must use the same sanitizer flags** that made the unpatched
+  baseline trigger. Recompiling the attack without matching flags (e.g., omitting
+  UBSan) can mask the bug and produce a false `VERIFIED_SECURE`.
+</Warning>
+
+## 3-Way Patch Rebasing
+
+When a prior pass's patch is still on disk, the patcher can attempt to **rebase**
+it onto the current snapshot instead of generating a fresh patch from scratch.
+This is an efficiency optimization for the common case where a prior fix applies
+with only minor line-number shifts.
+
+**Reachability conditions (all must hold):**
+
+1. The prior pass's snapshot directory and the file's prior unpatched version
+   **exist on disk** under `<state_root>/.mantis_snapshots/` (not GC'd).
+2. The finding's `signature` matches an archived finding with a prior
+   `patch_diff` (same bug, same signature).
+3. The archived finding's `patch_base_snapshot` is present and **different**
+   from the current `SNAPSHOT_ID` (confirms the snapshot changed since the
+   prior patch was verified).
+4. The finding's primary file is in `changed_files`.
+
+**3-Way Merge Mechanics** (from `references/patch_rebasing.md`):
+
+```
+base  = prior snapshot's unpatched version (scratch copy)
+ours  = base + prior patch_diff applied   (scratch copy)
+theirs = current snapshot's unpatched version (scratch copy)
+
+git merge-file -p <ours> <base> <theirs> > <result>
+```
+
+<Tabs>
+  <Tab title="Rebase Succeeds">
+    Clean merge (no conflict markers) → use the rebased patch as the starting
+    point. **Still run Block G** to confirm the rebased patch is correct. Record
+    a history note `patch-rebased-from: pass_<N-1>`.
+  </Tab>
+  <Tab title="Rebase Fails">
+    Merge conflict, file deleted, file renamed beyond recognition, or patched
+    function no longer exists → **fall back to fresh patch generation**
+    (Phase-1 behavior). Never apply a conflicting or ambiguous rebased patch.
+  </Tab>
+</Tabs>
+
+<Warning>
+  On **any** uncertainty about the rebased result, fall back to fresh patch
+  generation. The guardrail is fail-safe: omitting a rebase attempt is always
+  safe; applying a bad rebase can corrupt the codebase.
+</Warning>
+
+## Snapshot-Aware Idempotency Skip
+
+A finding is skipped as already-verified **only** when **both** hold:
+
+- `patch_status` is `VERIFIED_SECURE` or `MITIGATION_PROPOSED` **and**
+- `patch_base_snapshot` equals the current `SNAPSHOT_ID`
+
+If `patch_base_snapshot` is absent, empty, or different, the terminal status is
+stale — the finding is reopened and re-verified against the current snapshot.
+
+## Exploit Chain Propagation Rules
+
+Exploit chains are processed **after** all individual findings. The chain's
+`patch_status` is derived from its constituents in this priority order:
+
+| Condition | Chain `patch_status` |
+|-----------|----------------------|
+| Any constituent has `status = "FALSE_POSITIVE"` | Chain `status` set to `FALSE_POSITIVE`; skip patching |
+| Any constituent file is missing | `ERROR` |
+| Any constituent is not-yet-verified or stale against current snapshot | Remain unset (deferred) |
+| Any constituent has `patch_status = "ERROR"` | `ERROR` |
+| Any constituent has `patch_status = "VERIFICATION_FAILED"` | `VERIFICATION_FAILED` |
+| All verified; any is `MITIGATION_PROPOSED` | `MITIGATION_PROPOSED` |
+| All verified; any is `VERIFICATION_INCOMPLETE` | `VERIFICATION_INCOMPLETE` |
+| All verified; all are `VERIFIED_SECURE` | `VERIFIED_SECURE` |
+
+## Output Fields Written to Finding
+
+| Field | Description |
+|-------|-------------|
+| `patch_status` | `VERIFIED_SECURE`, `MITIGATION_PROPOSED`, `VERIFICATION_INCOMPLETE`, `VERIFICATION_FAILED`, or `ERROR` |
+| `patch_diff` | Unified diff of the verified fix (absent for binary targets and exploit chains) |
+| `patch_base_snapshot` | SNAPSHOT_ID this verdict was earned on (omitted in LEGACY mode) |
+| `reattack_status` | `bypassed_patch`, `failed_to_bypass`, or `inconclusive_baseline_changed` |
+| `reattack_variants` | Array of `{description, triggered}` objects (≥ 3 for `failed_to_bypass`) |
+
+## Long-Term Memory
+
+After processing each finding, the patcher appends one line to
+`workspace/learnings.jsonl`:
+
+```json
+{
+  "title": "<security_flaw_title>",
+  "code_paths": ["<path:line>"],
+  "status": "<VERIFIED_SECURE | MITIGATION_PROPOSED | VERIFICATION_INCOMPLETE | VERIFICATION_FAILED | ERROR>",
+  "patch_base_snapshot": "<current SNAPSHOT_ID>",
+  "snapshot": "<current SNAPSHOT_ID>"
+}
+```
+
+This allows `/mantis-plan` to avoid re-proposing patches for already-verified
+files in subsequent passes.

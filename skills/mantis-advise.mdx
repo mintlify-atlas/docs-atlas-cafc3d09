@@ -1,0 +1,286 @@
+---
+title: "/mantis-advise: Proactive Developer Security Advisor"
+sidebarTitle: "/mantis-advise"
+description: "Queries threat models, vulnerability lineages, verified patches, and invariants from knowledge.db to give developers security guardrails before code edits."
+---
+
+The `/mantis-advise` skill acts as a persistent security guardrail for developers and coding agents. Rather than running an active exploit campaign, it queries the Mantis knowledge database (`knowledge.db`) built up over prior review passes to surface relevant threat boundaries, previously confirmed vulnerabilities, verified remediation patterns, triaged false positives, and learned trajectory invariants for a specific target file or module. Use it before authoring or refactoring code, and when fixing a reported vulnerability to check for recurrence lineages. Do not use it for multi-pass automated red-team exploitation or fuzzing — those workflows belong to `/mantis-launch` and the broader pipeline.
+
+## Command
+
+```text
+/mantis-advise
+```
+
+The reference implementation is a standalone CLI script:
+
+```bash
+python3 reference/scripts/advise.py --file <target_file> [--db knowledge.db]
+```
+
+### Arguments
+
+<ParamField path="--file" type="string">
+  Target source file or component path (e.g., `src/auth.py` or `api/app.py`). When omitted, the query covers the entire repository scope.
+
+  Aliases: `-f`, `--target`, `-t`
+</ParamField>
+
+<ParamField path="--db" type="string">
+  Path to the Mantis SQLite knowledge database. Defaults to auto-discovery: searches `knowledge.db` and `workspace/knowledge.db` in the working directory, then in the `reference/` subdirectory.
+
+  Alias: `-d`
+</ParamField>
+
+<ParamField path="--lineage" type="string">
+  Query historical lifecycle and recurrence for a specific lineage UUID. Returns all findings records in the database that share this `lineage_id`, ordered by timestamp.
+
+  Alias: `-l`
+</ParamField>
+
+<ParamField path="--signature" type="string">
+  Query historical lifecycle for a specific content signature hash. Returns all findings records matching this `signature`.
+
+  Alias: `-s`
+</ParamField>
+
+<ParamField path="--json" type="boolean">
+  Emit raw structured JSON output instead of formatted Markdown advisory. Useful for programmatic consumption by pipelines or CI integrations.
+</ParamField>
+
+<ParamField path="--full" type="boolean">
+  Include full unabridged Markdown bodies and un-truncated patch diffs. By default, the advisor compacts verbose threat model documents and truncates patch diffs to the first 12 lines.
+</ParamField>
+
+<ParamField path="--export-okf" type="string">
+  Export all knowledge concepts to an OKF v0.2 directory bundle on disk. Provide the target directory path.
+</ParamField>
+
+<ParamField path="--import-okf" type="string">
+  Import an OKF v0.2 directory bundle from disk into `knowledge.db`. Provide the source directory path.
+</ParamField>
+
+## Input / Output Contract
+
+**Reads:**
+
+| Source | Tables / Content |
+|---|---|
+| `knowledge.db` | `findings`, `campaign_artifacts`, `learnings`, `risk_scores`, `okf_concepts` tables |
+| Target source code files | Read from repository root for contextual reference |
+
+**Writes:**
+
+Structured Security Advisory in Markdown format (to stdout), or structured JSON when `--json` is passed. No files are written to disk during a standard query.
+
+## Two Execution Modes
+
+<Tabs>
+  <Tab title="CLI (Recommended for Coding Agents)">
+    Agents with standard bash access run the script directly:
+
+    ```bash
+    # Query security guidance for a target file
+    python3 reference/scripts/advise.py --file src/auth.py
+
+    # Query a specific bug lineage
+    python3 reference/scripts/advise.py --lineage c3a5e982-1234-5678-9abc-def012345678
+
+    # Machine-readable JSON output
+    python3 reference/scripts/advise.py --file src/auth.py --json
+    ```
+  </Tab>
+  <Tab title="Python API (Inside Pipeline / Harness)">
+    When running inside an agent harness or Python environment:
+
+    ```python
+    from core.database import query_security_guidance
+
+    guidance = query_security_guidance(db_path="knowledge.db", filepath="src/auth.py")
+    print(guidance["guidance_summary"])
+    ```
+
+    Or via the tool helper:
+
+    ```python
+    get_security_guidance(filepath="src/auth.py")
+    ```
+  </Tab>
+</Tabs>
+
+## OKF v0.2 Knowledge Format
+
+All Mantis knowledge is stored in the database under the **Open Knowledge Format (OKF) v0.2** — a typed concept model that organizes security knowledge into structured, queryable entries. The `okf_concepts` table holds:
+
+| Concept Type | Description |
+|---|---|
+| `Threat Boundary` / `Threat Model` | Component trust boundaries, entry points, and sensitive assets |
+| `Component Entity` / `Software Entity` / `Hardware Entity` | Architecture summaries and component constraints |
+| `Security Invariant` / `Guardrail` | Verified must-hold properties and known-safe idioms |
+| `Vulnerability Pattern` / `Weakness Pattern` | Historical bug classes with root-cause analysis and remediation |
+
+### Trust Tiers
+
+Every OKF concept carries a `trust_tier` that reflects how the knowledge was validated:
+
+<CardGroup cols={2}>
+  <Card title="unverified" icon="question">
+    Machine-inferred from static analysis. No human or dynamic confirmation.
+  </Card>
+  <Card title="heuristic" icon="magnifying-glass">
+    Derived from heuristic rules or pattern matching. Default for most auto-generated concepts.
+  </Card>
+  <Card title="machine_confirmed" icon="robot">
+    Dynamically confirmed by sandbox reproduction, sanitizer output, or verified patch re-attack.
+  </Card>
+  <Card title="human_reviewed" icon="user-check">
+    Explicitly reviewed and endorsed by a human security expert.
+  </Card>
+</CardGroup>
+
+The advisor computes a **highest trust badge** for the whole advisory:
+- **`HUMAN-REVIEWED`** — any scoped OKF concept carries `human_reviewed`
+- **`SANDBOX-CONFIRMED`** — any concept carries `machine_confirmed`, or any finding is `patch_verified` / `dynamic_confirmed` / `reproduced`
+- **`HEURISTIC`** — default when only heuristic-tier knowledge is available
+
+### Exporting and Importing OKF Bundles
+
+OKF bundles allow transferring accumulated knowledge between databases or teams:
+
+```bash
+# Export all knowledge to a directory bundle
+python3 reference/scripts/advise.py --export-okf /path/to/okf-bundle/
+
+# Import a bundle into a fresh or existing database
+python3 reference/scripts/advise.py --import-okf /path/to/okf-bundle/ --db knowledge.db
+```
+
+## Advisory Output Format
+
+The default Markdown output is structured into six sections:
+
+````markdown
+# Security Advisory & Development Guidance for: src/auth.py
+**[OKF TRUST TIER: SANDBOX-CONFIRMED]**
+
+## 1. Threat Model & Trust Boundaries
+### Auth Service Boundary
+- **Entry Points**: External HTTPS API, OAuth callback endpoints
+- **Sensitive Assets**: Session tokens, user credentials, refresh keys
+
+## 2. Component Architecture & Known Constraints
+### AuthModule [MACHINE-CONFIRMED]
+*Handles authentication and session management for the public API layer.*
+
+## 3. Verified Security Guardrails & Invariants
+- ⛔ **[MACHINE-CONFIRMED] Path Traversal Guard**: All file operations must resolve against the jail directory using `os.path.abspath` with `startswith(jail_dir)`.
+- ℹ️ The researcher assumed the `redirect_uri` was validated server-side, but validation occurs client-side only.
+
+## 4. Historical Vulnerabilities & Verified Remediation Patterns
+### ⚠️ [CWE-89] SQL Injection via username parameter (Lineage: `c3a5e982-...`)
+- **File**: `src/auth.py` | **Severity**: HIGH | **Status**: `patch_verified`
+- **Description**: Unsanitized username concatenated directly into SQL query.
+- **Remediation**: Use parameterized queries via `db.execute("SELECT ... WHERE user=?", (username,))`.
+- **Verified Patch Diff (Few-Shot Pattern)**:
+```diff
+-  query = f"SELECT * FROM users WHERE username='{username}'"
++  query = "SELECT * FROM users WHERE username=?"
++  cursor.execute(query, (username,))
+```
+
+## 5. Triaged False Positives (Intentional / Safe Patterns)
+### ℹ️ Apparent eval() usage in template engine
+- **Status**: `false_positive`
+- **Pattern**: The `eval()` call in `render_template()` operates only on a hardcoded, sanitized template registry — not on user input.
+
+## 6. Recurrent Pitfalls & Lineage Regressions
+- **Lineage `c3a5e982-...`** (Seen 3x across passes): `SQL Injection via username parameter` (Statuses: patch_verified,confirmed,patch_verified)
+````
+
+## Core Advisory Protocols
+
+<Steps>
+  <Step title="Pre-Implementation Security Context Check">
+    Before authoring code or refactoring a module, run:
+
+    ```bash
+    python3 reference/scripts/advise.py --file <target_file>
+    ```
+
+    Review the returned advisory for:
+    - **Trust Boundaries** — who interacts with this module and from where
+    - **Historical Pitfalls** — confirmed vulnerabilities on this file; check `lineage_id` chains for recurrence
+    - **Verified Safe Idioms** — patch diffs from prior `VERIFIED_SECURE` passes
+    - **Triaged False Positives** — patterns previously classified as safe; do not reintroduce them as findings
+  </Step>
+  <Step title="Trust Boundary Verification">
+    When introducing new endpoints, parameters, or subprocess execution:
+
+    - **File paths:** Resolve against jail boundaries with `os.path.abspath` + `startswith(jail_dir)`.
+    - **OS commands:** Use `shlex.quote` or array-based `subprocess.run(["cmd", arg])` — never `shell=True`.
+    - **Server-side validation:** Never rely solely on client-side validation; enforce schema validation on the server even when the client validates first.
+  </Step>
+  <Step title="Lineage and Recurrence Defense">
+    When fixing a reported vulnerability, query its lineage to check for recurrence:
+
+    ```bash
+    python3 reference/scripts/advise.py --lineage <lineage_uuid>
+    ```
+
+    Ensure the fix closes all attack vectors demonstrated in prior re-attack verification test suites, not just the specific instance that was reported.
+  </Step>
+</Steps>
+
+## Usage Examples
+
+<CodeGroup>
+```bash File scope query
+python3 reference/scripts/advise.py --file src/auth.py
+```
+
+```bash Repo-wide query
+python3 reference/scripts/advise.py
+```
+
+```bash Lineage history
+python3 reference/scripts/advise.py --lineage c3a5e982-1234-5678-9abc-def012345678
+```
+
+```bash Signature history
+python3 reference/scripts/advise.py --signature a3f1b2c9d4e5
+```
+
+```bash JSON output for CI integration
+python3 reference/scripts/advise.py --file src/auth.py --json
+```
+
+```bash Full unabridged output
+python3 reference/scripts/advise.py --file src/auth.py --full
+```
+
+```bash Export OKF bundle
+python3 reference/scripts/advise.py --export-okf ./okf-export/
+```
+
+```bash Import OKF bundle
+python3 reference/scripts/advise.py --import-okf ./okf-export/ --db knowledge.db
+```
+</CodeGroup>
+
+## Notes
+
+<Note>
+**All knowledge lives in `knowledge.db`.** Do not look for flat files like `learnings.jsonl` or `workspace/findings/*.json` when using this skill. The database is the single source of truth for security knowledge.
+</Note>
+
+<Note>
+**Database auto-discovery:** When `--db` is not specified, the script searches for `knowledge.db` in the current working directory, `workspace/`, `reference/`, and the script's own parent directories. The first match wins.
+</Note>
+
+<Tip>
+Use `--json` to integrate advisor output into automated code review pipelines or pre-commit hooks. The returned JSON object includes `trust_tier`, `confirmed_vulnerabilities`, `false_positives`, `recurrent_lineages`, and `learned_invariants` as structured fields ready for programmatic consumption.
+</Tip>
+
+<Warning>
+OKF `--import-okf` initializes the database if it does not yet exist. When exporting, a target directory path is required and must be writable. Neither operation requires an existing `knowledge.db` when importing.
+</Warning>

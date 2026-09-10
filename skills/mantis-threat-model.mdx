@@ -1,0 +1,134 @@
+---
+title: "/mantis-threat-model: Living Threat Model Builder"
+sidebarTitle: "/mantis-threat-model"
+description: "Synthesizes KB entities into THREAT_MODEL.md covering trust boundaries, attacker profiles, high-risk assets, and a fail-closed deployment-intent verdict."
+---
+
+The `/mantis-threat-model` skill reads the Knowledge Base produced by `/mantis-architecture` and synthesizes it into a structured, living threat model (`workspace/kb/THREAT_MODEL.md`). It defines who the attackers are, where they can reach the system, what high-value assets are at risk, and — critically — whether the codebase is production software or sample/test code. Run it as Stage B of the KB generation process, after `/mantis-architecture` and before `/mantis-plan`. Do not use it to analyze source code directly or to extract raw learnings from JSONL files.
+
+## Command
+
+```
+/mantis-threat-model [--state_root <dir>] [--snapshot_id <id>] [--snapshot_root <dir>]
+```
+
+<ParamField path="--state_root" type="string" optional>
+  Parent directory of `workspace/`. Locates `.mantis_state.json`, the KB, and the archive directory. When absent, defaults to `./workspace/` (today's behavior).
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The `SNAPSHOT_ID` for this pass. Stamped as the `KB_SNAPSHOT:` provenance line in `THREAT_MODEL.md`. If absent, falls back to `active_snapshot.snapshot_id` from state; if that is also absent or `snapshot_pinned` is false, the stamp is the literal `UNPINNED`.
+</ParamField>
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Accepted for interface uniformity. **Not used** — this skill never reads target source code.
+</ParamField>
+
+<Note>
+  **Findings-only stage.** `/mantis-threat-model` never reads target source code. Every input it uses — `architecture.md`, `entities/*.md`, the prior `THREAT_MODEL.md`, and `.mantis_state.json` — is STATE-RELATIVE. Block A steps 2–6 are skipped; the skill still reads `active_snapshot` from state for provenance.
+</Note>
+
+## Input / Output Contract
+
+### Reads
+
+| Path | Purpose |
+|------|---------|
+| `workspace/.mantis_state.json` | Pass number (for archive naming) and `active_snapshot` (provenance only) |
+| `workspace/kb/architecture.md` | System data flows and high-level design |
+| `workspace/kb/entities/*.md` | Component definitions, constraints, and availability classifications |
+| `workspace/kb/THREAT_MODEL.md` (prior, if present) | First `KB_SNAPSHOT:` line only — freshness check |
+
+### Writes
+
+| Path | Content |
+|------|---------|
+| `workspace/kb/THREAT_MODEL.md` | Structured threat model (first line is `KB_SNAPSHOT: <CUR>`) |
+| `workspace/archive/kb/THREAT_MODEL_pass_N.md` | Copy of the prior model before overwrite (non-destructive) |
+
+## Usage
+
+### Standalone invocation
+
+```bash
+/mantis-threat-model
+```
+
+### With snapshot identity and state root (orchestrated)
+
+```bash
+/mantis-threat-model \
+  --snapshot_id snap_abc \
+  --state_root /tmp/mantis/state
+```
+
+## Threat Model Sections
+
+The generated `workspace/kb/THREAT_MODEL.md` includes the following sections:
+
+<Steps>
+  <Step title="System Overview Summary">
+    A concise summary derived from `architecture.md`. Provides downstream planners with a quick system orientation.
+  </Step>
+  <Step title="Deployment Intent">
+    States exactly one of `Intent: PRODUCTION` or `Intent: SAMPLE_OR_TEST_ONLY`. This verdict has significant downstream effects — see the PRODUCTION-SIGNAL CHECKLIST note below.
+  </Step>
+  <Step title="Trust Boundaries">
+    Rigorous definitions of where untrusted inputs cross into trusted contexts. References specific entities using relative KB links (e.g., `[Auth Module](entities/auth_module.md)`).
+  </Step>
+  <Step title="Threat Actors & Vectors">
+    Profiles of potential attackers (e.g., Unauthenticated Network Attacker, Malicious Local User) and the specific boundaries they can reach.
+  </Step>
+  <Step title="High-Risk Assets">
+    Data, execution privileges, or availability targets an attacker wants to compromise, classified into availability tiers: `CRITICAL`, `STANDARD`, or `LOW_CRITICALITY`.
+  </Step>
+</Steps>
+
+## Notes
+
+<Accordion title="Deployment Intent: PRODUCTION-SIGNAL CHECKLIST">
+  The `Intent: SAMPLE_OR_TEST_ONLY` verdict has a **large blast radius** — `/mantis-critic` marks every finding from the pass as `SAMPLE_OR_TEST` (dismissing the whole pass) the instant it reads this verdict. It is therefore fail-closed behind a 5-item checklist.
+
+  You may write `Intent: SAMPLE_OR_TEST_ONLY` **ONLY IF ALL five checks are TRUE**. If any is false or the KB is silent on it, you **must** write `Intent: PRODUCTION`:
+
+  1. No entity in `workspace/kb/entities/*.md` is classified `CRITICAL` or `STANDARD` availability.
+  2. `architecture.md` names no externally-reachable service, daemon, server, API, network endpoint, or deployment descriptor (systemd, Docker, Kubernetes, load balancer, cloud/IaC, CI/CD publish).
+  3. The KB describes no installable/publishable package or runtime entrypoint (`console_scripts`, `entry_points`, a `main()` service binary, or a published library).
+  4. Every component/path in the KB lies exclusively under test/sample directories (paths contain `test`, `tests`, `example`, `examples`, `sample`, `samples`, `tutorial`, `demo`, `docs`, or `fixtures`), and none lie under production roots (`src`, `lib`, `pkg`, `internal`, `cmd`, `app`, `server`, or `core`).
+  5. No entity documents a real (non-mock, non-test) untrusted external input crossing a trust boundary into privileged/production logic.
+
+  After a sync (`SYNC_OCCURRED == true`), the checklist **must** be re-run from scratch — never inherit a prior `Intent:` verdict, as a sync can add production code to a previously sample-only tree.
+</Accordion>
+
+<Accordion title="Sync-delta and STALE behavior">
+  The skill computes a `SYNC_OCCURRED` flag by comparing the `KB_SNAPSHOT:` stamp in the prior `THREAT_MODEL.md` (`PREV_TM`) against `CUR` (the current snapshot ID):
+
+  - `CUR == "UNPINNED"` → `SYNC_OCCURRED = true` (degraded; always re-derive)
+  - `PREV_TM == ""` → `SYNC_OCCURRED = true` (first run or legacy KB)
+  - `PREV_TM != CUR` → `SYNC_OCCURRED = true` (snapshot advanced since last model)
+  - `PREV_TM == CUR` → `SYNC_OCCURRED = false` (snapshot unchanged)
+
+  When `SYNC_OCCURRED == false`: the prior model's substance may be reused, but a STALE banner is inserted immediately after the `KB_SNAPSHOT:` line:
+
+  ```
+  > STALE: Threat model NOT re-evaluated this pass; carried unchanged from snapshot <CUR>.
+  ```
+
+  When `SYNC_OCCURRED == true`: all sections are re-derived fresh, including the Deployment-Intent checklist. The STALE banner is not emitted.
+</Accordion>
+
+<Accordion title="Non-destructive archiving">
+  Before overwriting `workspace/kb/THREAT_MODEL.md`, the prior version is **copied** (not moved) to `workspace/archive/kb/THREAT_MODEL_pass_N.md`, where `N` is the current pass number from `.mantis_state.json`. This preserves every historical threat model version and prevents overwrite from destroying useful context.
+</Accordion>
+
+<Accordion title="Availability tier classifications">
+  High-risk assets in the threat model are classified by availability tier:
+
+  | Tier | Meaning |
+  |------|---------|
+  | `CRITICAL` | 24/7 immediate operational impact if disrupted |
+  | `STANDARD` | Important operations; short downtime is tolerable |
+  | `LOW_CRITICALITY` | Non-blocking utilities; disruption is a mild annoyance |
+
+  These classifications feed back into `/mantis-architecture`'s entity files and are used by `/mantis-critic` when evaluating finding impact.
+</Accordion>

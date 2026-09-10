@@ -1,0 +1,222 @@
+---
+title: "State Schema — Mantis Orchestrator State Contract"
+sidebarTitle: "State"
+description: "Reference for workspace/.mantis_state.json — tracks pass number, snapshot mode (MODE-OFF/PINNED/HALT), VCS provenance, and changed-files diffs across runs."
+---
+
+The orchestrator state file at `workspace/.mantis_state.json` is the durable record of the pipeline's execution context across passes. It is read and updated by the orchestrator (or the `/mantis-meta-agent`) at the boundaries of every pipeline pass, and selectively read by individual skills that need to know the current pass number, the active snapshot, or which files changed since the previous run. The two required fields — `pass_number` and `last_updated` — are always present. All snapshot-lifecycle fields are optional and were added under a strict backward-compatibility guarantee: any absent field routes the consumer to the safe/conservative branch (described per field below), so a pre-existing state file validates and runs unchanged.
+
+<Info>
+  The state file is the **only** place snapshot provenance is centrally recorded. Individual findings store their own `discovery_commit` field, which must match the `active_snapshot.snapshot_id` from the state file at the time of their creation.
+</Info>
+
+## Required Fields
+
+<ParamField body="pass_number" type="integer" required>
+  The current sequential pass number of the pipeline. Incremented by the orchestrator at the end of each pass, after findings are archived. Starts at 1 for the first pass.
+</ParamField>
+
+<ParamField body="last_updated" type="string (date-time)" required>
+  ISO 8601 timestamp of when the state file was last written. Updated by the orchestrator at every state mutation.
+</ParamField>
+
+---
+
+## The Three-Mode Snapshot Model
+
+The snapshot lifecycle is controlled by the presence and contents of the `active_snapshot` object. The pipeline operates in exactly one of three modes per pass:
+
+<Tabs>
+  <Tab title="MODE-OFF">
+    **`active_snapshot` is absent** from the state file.
+
+    This is the default mode for plain CLI use, manual runs, and harnesses that do not implement the Pass Lifecycle Contract. The pipeline runs exactly as it did before the snapshot model was introduced: a point-in-time review of whatever code is currently on disk, with all verdicts permitted (`VERIFIED_SECURE`, `failed_to_reproduce`, `DUPLICATE`, `FALSE_POSITIVE`, and `NON_VIABLE` are all emittable). Every snapshot match check reports "NOT_MATCHED" because there is no `active_snapshot` to compare against, but this does not prevent any verdict.
+
+    **When active:** `snapshot_pinned` is irrelevant because `active_snapshot` itself is absent.
+  </Tab>
+  <Tab title="PINNED">
+    **`active_snapshot` is present with `snapshot_pinned: true`.**
+
+    The orchestrator successfully pinned an immutable copy of the target under `.mantis_snapshots/` and wrote the sentinel file `<SNAPSHOT_ROOT>/.mantis_snapshot_id`. Every stage reads code from the pinned root (`active_snapshot.root`) and uses the recorded `snapshot_id` for all Snapshot Match Checks. Full gating is active: authoritative verdicts are only emitted when `discovery_commit` exactly matches `active_snapshot.snapshot_id`.
+
+    **When active:** The pipeline is in full integrity mode. Findings discovered against different snapshots are re-researched rather than filtered.
+  </Tab>
+  <Tab title="HALT">
+    **`active_snapshot` is present with `snapshot_pinned: false`.**
+
+    The orchestrator was asked to pin a snapshot (e.g., via `--sync`) but could not — for example, because the target is a live endpoint that cannot be copied, the tree was too large, a copy failed, or the tree was dirty and racing with edits. The pass runs in a degraded, non-authoritative mode: no `VERIFIED_SECURE`, `failed_to_reproduce`, `DUPLICATE`, `FALSE_POSITIVE`, or `NON_VIABLE` verdict may be emitted. Every Snapshot Match Check returns `NOT_MATCHED`. Live endpoints and uncopyable targets run in HALT by design when `--sync` is requested.
+
+    **When active:** Results are advisory only. The `root` field may point at the live tree.
+  </Tab>
+</Tabs>
+
+<Warning>
+  A harness that does not implement the Pass Lifecycle Contract **must** leave `active_snapshot` absent (MODE-OFF). It must **not** write `active_snapshot` with `snapshot_pinned: false` unless it genuinely attempted to pin a snapshot and failed.
+</Warning>
+
+---
+
+## Active Snapshot Object
+
+<ParamField body="active_snapshot" type="object">
+  The immutable pinned snapshot for the current pass. Written by the orchestrator during the Pin step, **after** sync. Absent → MODE-OFF. Present → PINNED or HALT depending on `snapshot_pinned`.
+
+  <ParamField body="active_snapshot.root" type="string">
+    Absolute path to the pinned snapshot root (`SNAPSHOT_ROOT`). All stages read target code from this path via `--snapshot_root`. When `snapshot_pinned` is `false` (HALT mode), this may point at the live tree.
+  </ParamField>
+
+  <ParamField body="active_snapshot.snapshot_id" type="string">
+    The `SNAPSHOT_ID` of the pinned snapshot, computed once per pass using the SNAPSHOT_ID ladder:
+
+    | Condition | SNAPSHOT_ID format |
+    |---|---|
+    | Clean git / hg | `commit_hash` |
+    | Dirty git / hg | `commit_hash:content_hash` |
+    | multi-vcs (`.repo`) | `revision:content_hash` |
+    | No VCS / unknown, copyable | `content:<content_hash>` |
+    | Single binary / firmware | `sha256:<artifact_hash>` |
+    | Live endpoint / uncopyable / copy failed | `live:<ISO8601>` (→ HALT) |
+
+    `content_hash` is a SHA-256 over every file in the pinned copy. This means an unchanged dirty or no-VCS tree produces the **same** ID across passes, enabling deduplication, while a changed tree produces a different ID.
+  </ParamField>
+
+  <ParamField body="active_snapshot.snapshot_pinned" type="boolean">
+    `true` when an immutable copy was successfully pinned and its sentinel (`<SNAPSHOT_ROOT>/.mantis_snapshot_id`) was written → PINNED mode. `false` when the orchestrator attempted to pin but failed → HALT mode. When `active_snapshot` is absent, this field is irrelevant.
+  </ParamField>
+
+  <ParamField body="active_snapshot.pass" type="integer">
+    The `pass_number` this snapshot was pinned for. Used by crash-resume logic (same pass on re-entry → reuse existing snapshot directory, never re-pin) and by every consumer stage as a staleness gate: if `active_snapshot.pass != state.pass_number`, the snapshot is stale for this pass and the stage must HALT-degrade (no authoritative verdicts, `NOT_MATCHED` for all Snapshot Match Checks, `repro_status: not_attempted`).
+  </ParamField>
+
+  <ParamField body="active_snapshot.vcs_type" type="enum">
+    The detected VCS type of the target for this pass. One of: `git`, `hg`, `multi-vcs`, `none`, `unknown`.
+  </ParamField>
+</ParamField>
+
+---
+
+## Snapshot History
+
+<ParamField body="snapshot_history" type="object[]">
+  An **append-only** log of one entry per pinned pass, in pass order. The orchestrator appends exactly one entry during the Pin step and **never** overwrites prior entries. The Changed-Files diff (`changed_files`) is computed by reading the entry immediately before the current pass as `PREV` and diffing `PREV.snapshot_id` against the current `snapshot_id`.
+
+  If the `PREV` entry is missing (first pinned pass or legacy state file), the diff degrades to `UNKNOWN` and every file is treated as changed.
+
+  Each entry has:
+
+  | Field | Type | Description |
+  |---|---|---|
+  | `pass` | integer | The `pass_number` this entry records. |
+  | `snapshot_id` | string | The `SNAPSHOT_ID` pinned for that pass. |
+  | `snapshot_pinned` | boolean | Whether that pass successfully pinned (`false` → that pass ran degraded). |
+  | `timestamp` | string (date-time) | ISO 8601 timestamp when the entry was appended. |
+</ParamField>
+
+---
+
+## VCS Info
+
+<ParamField body="vcs_info" type="object">
+  Information about the target's version control system state, recorded after sync. The only required sub-field is `vcs_type`.
+
+  <ParamField body="vcs_info.vcs_type" type="enum" required>
+    The detected VCS type: `git`, `hg`, `multi-vcs`, `none`, or `unknown`.
+  </ParamField>
+
+  <ParamField body="vcs_info.commit_hash" type="string">
+    The current commit hash or revision ID. Required when `vcs_type` is `git` or `hg`.
+  </ParamField>
+
+  <ParamField body="vcs_info.branch" type="string">
+    The active branch name. Required when `vcs_type` is `git` or `hg`.
+  </ParamField>
+
+  <ParamField body="vcs_info.revision" type="string">
+    The manifest revision identifier. Required when `vcs_type` is `multi-vcs`.
+  </ParamField>
+
+  <ParamField body="vcs_info.dirty" type="boolean">
+    `true` if there are uncommitted changes in the target repository. Required when `vcs_type` is `git`, `hg`, or `multi-vcs`.
+  </ParamField>
+
+  <ParamField body="vcs_info.snapshot_id" type="string">
+    Redundant copy of `active_snapshot.snapshot_id` kept for legacy harnesses that read `vcs_info` rather than `active_snapshot`. Absent for default meta-agent runs. Absent → pass ran unpinned/legacy (degraded).
+  </ParamField>
+</ParamField>
+
+---
+
+## Knowledge Base Provenance
+
+<ParamField body="kb_snapshot_id" type="string">
+  The `SNAPSHOT_ID` the Knowledge Base at `workspace/kb/` was last built or refreshed against. Consumers compare this to the current pass `SNAPSHOT_ID` to determine whether the KB is stale. Absent → KB provenance is unknown → treat the KB as stale and force a rebuild (re-run `/mantis-architecture`).
+</ParamField>
+
+---
+
+## Changed Files
+
+<ParamField body="changed_files" type="string[]">
+  An efficiency **hint only**: repo-relative paths of files that changed between the previous pinned snapshot and the current one. Written by `/mantis-plan` (Block E) alongside `changed_files_status`. This list is **never** used to drop or skip a finding — only to prioritize and broaden re-research toward recently modified code. Meaningful only when `changed_files_status` is `COMPUTED`. Absent → treat as `UNKNOWN` (all files potentially changed).
+</ParamField>
+
+<ParamField body="changed_files_status" type="enum">
+  Whether `changed_files` is a trustworthy diff. One of:
+  - `COMPUTED` — The diff was successfully computed by comparing `PREV.snapshot_id` to the current `snapshot_id`.
+  - `UNKNOWN` — The diff could not be computed (no `PREV` entry, unpinned pass, `vcs_type` is `none` or `unknown`, a `content:` / `live:` ID on either end, or a diff error).
+
+  `UNKNOWN` **must** be treated as "every file changed" — never drop a finding, never skip a file. Absent → `UNKNOWN`.
+</ParamField>
+
+<ParamField body="changed_files_pass" type="integer">
+  The `pass_number` when `changed_files` and `changed_files_status` were last computed. Consumers must compare this to `state.pass_number`: if absent or different, the diff is from a prior pass and must be treated as `UNKNOWN`. Written by `/mantis-plan` alongside `changed_files`.
+</ParamField>
+
+---
+
+## Example State File
+
+The following is a realistic `workspace/.mantis_state.json` from the second pass of a pinned git-backed run:
+
+```json
+{
+  "pass_number": 2,
+  "last_updated": "2025-01-15T14:30:00Z",
+  "vcs_info": {
+    "vcs_type": "git",
+    "commit_hash": "abc123def456789",
+    "branch": "main",
+    "dirty": false
+  },
+  "active_snapshot": {
+    "root": "/home/user/project/.mantis_snapshots/pass_2",
+    "snapshot_id": "abc123def456789",
+    "snapshot_pinned": true,
+    "pass": 2,
+    "vcs_type": "git"
+  },
+  "snapshot_history": [
+    {
+      "pass": 1,
+      "snapshot_id": "9f8e7d6c5b4a3210",
+      "snapshot_pinned": true,
+      "timestamp": "2025-01-14T09:15:00Z"
+    },
+    {
+      "pass": 2,
+      "snapshot_id": "abc123def456789",
+      "snapshot_pinned": true,
+      "timestamp": "2025-01-15T14:25:00Z"
+    }
+  ],
+  "kb_snapshot_id": "abc123def456789",
+  "changed_files": [
+    "src/api/auth_handler.py",
+    "src/db/user_repository.py"
+  ],
+  "changed_files_status": "COMPUTED",
+  "changed_files_pass": 2
+}
+```
+
+In this example, the pipeline is on pass 2 in PINNED mode. The `snapshot_history` shows that pass 1 pinned a different commit. The `changed_files` list shows only two files changed between passes, allowing `/mantis-researcher` to prioritize those files in the new pass.

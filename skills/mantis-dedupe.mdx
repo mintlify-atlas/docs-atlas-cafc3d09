@@ -1,0 +1,203 @@
+---
+title: "/mantis-dedupe: Duplicate Finding Consolidation"
+sidebarTitle: "/mantis-dedupe"
+description: "Cluster and merge identical or overlapping security findings into single canonical records, eliminating redundant reports before downstream review stages."
+---
+
+After a research pass, the `workspace/findings/` directory often contains multiple findings that describe the same underlying flaw at the same code location — emitted by different research trajectories or loop iterations. `/mantis-dedupe` resolves this by running a deterministic 3-tier deduplication ladder that compares findings using exact heuristic anchors, root-cause normalization, and vector-embedding similarity, then merges confirmed duplicates into a single primary record. Use it after raw findings have been generated but before `/mantis-review`. Do not use it for initial code auditing, reproduction, or patch generation — it operates solely on the findings workspace.
+
+## Command
+
+```
+/mantis-dedupe [--snapshot_root=<path>] [--snapshot_id=<id>] [--state_root=<path>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Path to the pinned, immutable snapshot copy for this pass. When present,
+  deduplication is snapshot-gated: only findings whose `discovery_commit`
+  matches the current snapshot are treated as hard duplicates.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The SNAPSHOT_ID string for the current pass. Used as the snapshot identity
+  anchor for the pairwise match check. When absent alongside `--snapshot_root`,
+  the skill falls back to MODE-OFF (legacy behavior).
+</ParamField>
+
+<ParamField path="--state_root" type="string" default=".">
+  Parent directory of `workspace/`. All `workspace/...` paths resolve relative
+  to this root.
+</ParamField>
+
+<Note>
+  When none of the three flags are supplied, the skill reads
+  `active_snapshot` from `workspace/.mantis_state.json`. If that is also
+  absent, it runs in MODE-OFF: no snapshot gating, dedup by
+  `signature` (or line-inclusive `code_paths` + title as fallback).
+</Note>
+
+## Input / Output Contract
+
+<Tabs>
+  <Tab title="Reads">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/*.json` | Raw finding files to evaluate (hidden dirs like `.trash/` are ignored) |
+    | `workspace/archive/findings_pass_*/*.json` | Archived findings from previous passes — used for loop-duplicate detection |
+    | `workspace/archive/loop*_findings/*.json` | Legacy archive paths — same purpose |
+    | `workspace/.mantis_state.json` | Current `pass_number`, `active_snapshot` provenance, and snapshot fields |
+  </Tab>
+  <Tab title="Writes">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/<primary_id>.json` | Updated primary finding (merged title, severity, code paths, history) |
+    | `workspace/findings/.trash/<dup_id>.json` | Duplicate findings moved here after `status` is set to `"DUPLICATE"` |
+    | `workspace/helpers/merge_findings.py` | Versioned helper script (`MANTIS_HELPER_VERSION = 2`) that performs the deterministic merge |
+    | `workspace/.tx_log.jsonl` | Append-only transaction log recording every `loop_filter` and `dedupe_merge` action |
+  </Tab>
+</Tabs>
+
+<Warning>
+  `/mantis-dedupe` never reads `workspace/historical_learnings.jsonl`. Skipping
+  that file is intentional — it ensures regressions (old bugs reintroduced to
+  the codebase) are always re-flagged rather than silently filtered.
+</Warning>
+
+## Usage
+
+```
+/mantis-dedupe
+```
+
+Invoke without arguments in the default (MODE-OFF) configuration. The skill
+reads `workspace/findings/`, resolves any loop-level duplicates against the
+archive, runs the 3-tier ladder on the remaining set, and writes the merged
+primary files and transaction log.
+
+**With a pinned snapshot (orchestrator-managed pipeline):**
+
+```
+/mantis-dedupe \
+  --snapshot_root=/tmp/mantis_snapshots/pass_3 \
+  --snapshot_id=abc123def456 \
+  --state_root=/workspace
+```
+
+## 3-Tier Deduplication Ladder
+
+The core deduplication algorithm runs three tiers in order, stopping at the
+first tier that produces a definitive match.
+
+<Steps>
+  <Step title="Tier 1 — Fast-Path Exact Heuristic (< 1 ms, 0 tokens)">
+    Three anchors are checked in sequence:
+
+    1. **Content identity hash** — `sha256(canonical_filepath | canonical_cwe | target_symbol)`. Invariant to line shifts, backtick formatting, and title paraphrasing.
+    2. **Exact triple match** — `canonical_filepath + normalized CWE + target_symbol` must all match.
+    3. **Strict line proximity** — within ≤ 3 lines on the exact canonical filepath, when `target_symbol` is empty.
+
+    On a Tier 1 hit the findings immediately inherit a shared `lineage_id` with no LLM overhead.
+  </Step>
+  <Step title="Tier 2 — Root Cause Normalization">
+    When Tier 1 produces no exact anchor, a standardized 5-line Root Cause
+    Analysis (RCA) summary is synthesized: **Component**, **Vulnerability
+    Class**, **Root Cause Mechanism**, **Failure Condition**, and **Taint
+    Dataflow**. This normalized representation filters out surface-level
+    phrasing differences before the embedding scan.
+  </Step>
+  <Step title="Tier 3 — Vector Embedding & Cosine Similarity">
+    The RCA summary is projected into dense embeddings (default:
+    `vertex_ai/gemini-embedding-001`) and a nearest-neighbor scan is performed
+    over historical `lineage_vectors`.
+
+    - **Positive threshold ≥ 0.90** — merge into the same `lineage_id` (configurable via `EMBEDDING_SIMILARITY_THRESHOLD`).
+    - **Negative threshold < 0.70** — distinct vulnerability class; mint a fresh `lineage_id`.
+    - **CWE Family Guard** — if both findings carry explicit CWE IDs that belong to distinct, incompatible CWE families, candidate comparison is skipped entirely to prevent cross-class false merges.
+  </Step>
+</Steps>
+
+## Snapshot-Gated Loop Deduplication
+
+Before the 3-tier ladder, the skill filters findings that are genuine
+loop-duplicates of already-processed archived findings.
+
+The decision is governed by a **pairwise snapshot match check** comparing the
+_current_ finding's `discovery_commit` against the _archived_ finding's
+`discovery_commit` — not against the global `SNAPSHOT_ID`:
+
+<Accordion title="MATCHED — hard duplicate (safe to trash)">
+  Both `discovery_commit` values are present, non-empty, not the literal
+  `"MIXED"`, and **byte-for-byte equal** to each other. The skill sets
+  `"status": "DUPLICATE"` and `"duplicate_of": "<archived_uuid>"`, clears any
+  `possible_duplicate_of`, and moves the file to `.trash/`.
+</Accordion>
+
+<Accordion title="NOT_MATCHED — possible regression (keep active)">
+  Either value is missing, empty, `"MIXED"`, or the two differ. The finding
+  stays **active** and receives a soft `"possible_duplicate_of"` hint. If the
+  archived match was previously resolved (`VERIFIED_SECURE`,
+  `MITIGATION_PROPOSED`, `FALSE_POSITIVE`, or `NON_VIABLE`), the finding is
+  additionally annotated as a **POSSIBLE REGRESSION** and is never trashed.
+</Accordion>
+
+<Note>
+  **Line-inclusive key** — two findings at different lines in the same file
+  (e.g., `parser.c:100` vs `parser.c:900`) are always treated as **distinct**,
+  even if they share the same title and CWE. The `code_paths` comparison always
+  includes the trailing `:line` suffix.
+</Note>
+
+## Deterministic Merge Rules
+
+When findings are merged, the `merge_findings.py` helper applies these
+field-resolution rules:
+
+| Field | Rule |
+|-------|------|
+| `id` | Preserved from the **primary** (surviving) finding |
+| `title` | Most comprehensive / descriptive title wins |
+| `severity` | Highest severity level among merged items |
+| `privileges_required` | Most severe: `NONE` > `LOW` > `HIGH` |
+| `attacker_position` | Most critical: `EXTERNAL` > `INTERNAL_NETWORK` > `IN_CLUSTER` > `LOCAL` > `HOST_SYSTEM` > `SUPPLY_CHAIN` > `PHYSICAL_TEMPORARY` > `PHYSICAL_LONG_TERM` |
+| `user_interaction` | Most severe: `NONE` > `REQUIRED` |
+| `code_paths` | Union of all entries, deduplicated |
+| `description`, `mitigation`, `impact` | Concatenated cleanly |
+| `history` | All entries preserved; a new `"stage": "dedupe"` entry is appended |
+| Unknown / provenance keys | Copied through verbatim — never dropped |
+
+<Warning>
+  The helper refuses to merge two findings whose `discovery_commit` values
+  differ. Findings that describe different code versions must remain separate.
+</Warning>
+
+## Transaction Log
+
+Every file operation is logged to `workspace/.tx_log.jsonl` as a self-contained
+JSON line:
+
+```json
+{
+  "timestamp": "2026-07-14T15:13:00Z",
+  "action": "loop_filter | dedupe_merge",
+  "primary_uuid": "<UUID or null for loop_filter>",
+  "moved_uuid": "<UUID>"
+}
+```
+
+This log enables rollback review and auditing without destructive deletes — the
+`.trash/` directory is a staging area, not permanent deletion.
+
+## Notes
+
+<Note>
+  **Helper version guard** — before reusing `workspace/helpers/merge_findings.py`,
+  the skill checks that its first line is exactly `# MANTIS_HELPER_VERSION = 2`.
+  A missing or different version marker triggers regeneration of the helper
+  to avoid silent field omissions from older pipeline versions.
+</Note>
+
+<Tip>
+  For large batches (> 20 findings), the skill uses a **Map/Reduce chunking
+  strategy** — findings are grouped by target file or component before the
+  overlap check, keeping each comparison within the model context window.
+</Tip>

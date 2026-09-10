@@ -1,0 +1,122 @@
+---
+title: "/mantis-summarize: Security-Focused Directory Summarizer"
+sidebarTitle: "/mantis-summarize"
+description: "Writes security-focused mantis-summary.md files per directory via bottom-up traversal, cutting token overhead for downstream planning and research stages."
+---
+
+The `/mantis-summarize` skill preprocesses a repository by generating concise, security-focused `mantis-summary.md` files in each source directory. It uses a bottom-up (post-order) traversal so subdirectory summaries are written before their parents, letting each parent roll up child context without re-reading raw source files. Run it at the start of a review campaign, after `/mantis-history` and before `/mantis-plan`, to map the codebase and dramatically reduce token overhead for downstream skills. Do not use it to execute code reviews, write test scripts, or patch code.
+
+## Command
+
+```
+/mantis-summarize [--snapshot_root <dir>] [--snapshot_id <id>] [--state_root <dir>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Absolute path to the pinned, read-only code snapshot. Source files are read from this directory. In PINNED mode, summaries are **skipped** (the snapshot is read-only and consumers read `mantis-summary.md` from the source tree, not a mirror).
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The snapshot identifier for this pass. Used for provenance annotation.
+</ParamField>
+
+<ParamField path="--state_root" type="string" optional>
+  Parent directory of `workspace/`. The traversal script is written here. When absent, defaults to `./workspace/` (MODE-OFF).
+</ParamField>
+
+<Note>
+  **All flags absent → MODE-OFF.** `mantis-summary.md` files are written directly into each source directory, exactly as in today's default behavior.
+</Note>
+
+## Input / Output Contract
+
+### Reads
+
+| Path | Purpose |
+|------|---------|
+| `workspace/.mantis_state.json` | Current loop pass number |
+| `CODE_ROOT` source directories and files | Source content, excluding `node_modules`, `vendor`, `.git`, build outputs, and `tests/` |
+| Child `mantis-summary.md` files | Bottom-up rollup: parent reads children's summaries, not raw source |
+| `workspace/historical_learnings.jsonl` | Optional — enriches summaries with known past vulnerabilities |
+
+### Writes
+
+| Path | Content | Condition |
+|------|---------|-----------|
+| `<source_dir>/mantis-summary.md` | Security-focused directory summary | MODE-OFF and HALT only |
+| `workspace/` traversal script | Generated and executed at runtime | Always |
+
+<Warning>
+  **PINNED mode: summaries are skipped.** When `snapshot_pinned` is true, `CODE_ROOT` is read-only and no `mantis-summary.md` files are written. Consumers (plan, researcher) read summaries from the source tree directly — a state-relative mirror would not be read by any consumer.
+</Warning>
+
+<Warning>
+  **VCS cleanliness.** `mantis-summary.md` files must remain invisible to VCS dirty checks. The meta-agent deletes them from the target tree before any sync (Block C STEP 0). Never allow a summary to make the repository tree look dirty.
+</Warning>
+
+## Output Modes
+
+<Tabs>
+  <Tab title="MODE-OFF (default)">
+    No `active_snapshot` in state. `mantis-summary.md` is written into each source directory in-place, overwriting any prior version. This is the standard standalone behavior.
+  </Tab>
+  <Tab title="HALT mode">
+    `active_snapshot` is present but `snapshot_pinned` is false. Behaves identically to MODE-OFF: summaries are written into the source tree. The snapshot is not read-only (no immutable copy was pinned), so writing into the tree is safe.
+  </Tab>
+  <Tab title="PINNED mode">
+    `snapshot_pinned` is true. Summaries are **skipped entirely** this pass. The snapshot is a read-only copy and no consumer reads a state-relative mirror.
+  </Tab>
+</Tabs>
+
+## Usage
+
+### Standalone invocation (MODE-OFF)
+
+```bash
+/mantis-summarize
+```
+
+### With snapshot and state root (orchestrated)
+
+```bash
+/mantis-summarize \
+  --snapshot_root /tmp/mantis/snapshots/snap_abc \
+  --snapshot_id snap_abc \
+  --state_root /tmp/mantis/state
+```
+
+## Notes
+
+<Accordion title="What goes into each summary">
+  The generated traversal script instructs the LLM to produce a security-focused summary covering:
+
+  - **Core Components:** Primary files and subdirectories and what they do
+  - **API Endpoints & Exports:** Functions or classes exposed to other modules
+  - **Trust Boundaries & External Inputs:** Whether the directory handles untrusted data, network requests, or user input
+  - **Sensitive Operations:** Parsers, cryptographic functions, or memory management operations
+  - **Historical Vulnerabilities & Fixes:** Files with entries in `workspace/historical_learnings.jsonl` — past vulnerability classes, affected components, and fix patterns that signal recurring weaknesses
+
+  Summaries are kept to several thousand words or fewer so they can be efficiently incorporated by the planner and researcher.
+</Accordion>
+
+<Accordion title="Map-reduce traversal strategy">
+  The traversal is **bottom-up (post-order)**:
+
+  1. Leaf directories are summarized first, reading their raw source files directly.
+  2. Parent directories are summarized by reading their own source files **plus** the `mantis-summary.md` files of immediate subdirectories — not the raw source of those subdirectories.
+  3. This prevents unbounded context growth at higher levels of the tree while preserving rolled-up security context.
+
+  For very large directories, the script generates per-file summaries or processes files in chunks to avoid exceeding context window limits.
+</Accordion>
+
+<Accordion title="Idempotency">
+  The skill deterministically overwrites existing `mantis-summary.md` files in-place. Re-running it produces updated rollups that incorporate any new historical learnings or code changes. There is no skip-if-present logic — every run is a fresh generation.
+</Accordion>
+
+<Accordion title="Pipeline position">
+  `/mantis-summarize` is an optional pre-processing phase that sits between `/mantis-history` and `/mantis-plan`. Its output is consumed by:
+
+  - `/mantis-plan` (Mode A): reads `mantis-summary.md` instead of raw source files when crawling production directories, drastically reducing token usage.
+  - `/mantis-researcher`: uses summaries as quick-reference maps of directory contents and trust boundaries.
+  - `/mantis-architecture`: may read summaries when analyzing codebase structure.
+</Accordion>

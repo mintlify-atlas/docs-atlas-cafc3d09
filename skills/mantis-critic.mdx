@@ -1,0 +1,198 @@
+---
+title: "/mantis-critic: Production Viability Assessment"
+sidebarTitle: "/mantis-critic"
+description: "Assess whether validated findings remain exploitable in standard release builds, filtering out debug-only code, assertion traps, and compile-gated dead paths."
+---
+
+A finding that passes `/mantis-review` is logically valid but may still be
+unreachable in a production build — gated behind `#ifdef DEBUG`, stripped by
+`NDEBUG`, or blocked by OS-level sandboxing that is always active in
+deployment. `/mantis-critic` evaluates this by re-reading the actual source
+code and applying domain-specific production viability checks, adopting a
+**highly skeptical adversarial stance**: previous stages are not trusted, and
+every code path is independently re-verified. Use it after `/mantis-review`
+on `VALID` or `PROVISIONALLY_VALID` findings to confirm exploitability in
+release configurations before investing in reproduction. Do not use it for
+writing reproduction scripts or patches.
+
+## Command
+
+```
+/mantis-critic [--target_root=<path>] [--snapshot_root=<path>] [--snapshot_id=<id>] [--state_root=<path>]
+```
+
+<ParamField path="--target_root" type="string" optional>
+  AUTHORITATIVE path to the target codebase root. Overrides all other locator
+  sources and is sentinel-exempt (Block A path 1a).
+</ParamField>
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Path to the pinned immutable snapshot copy for this pass. Used as `CODE_ROOT`
+  when `--target_root` is absent (Block A path 1b).
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The `SNAPSHOT_ID` string the orchestrator computed for this pass. Used for
+  the Block A sentinel check and per-finding Block B drift comparison. Falls
+  back to `active_snapshot.snapshot_id` from state when omitted.
+</ParamField>
+
+<ParamField path="--state_root" type="string" default=".">
+  Path to the root of the Mantis state directory containing `workspace/`.
+  All `workspace/...` paths resolve relative to this root.
+</ParamField>
+
+## Input / Output Contract
+
+<Tabs>
+  <Tab title="Reads">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/*.json` | All findings regardless of status (including `FALSE_POSITIVE` and `NEEDS_RESEARCH`) |
+    | `workspace/kb/THREAT_MODEL.md` | Deployment intent; KB freshness gate for blanket `SAMPLE_OR_TEST` mass-marking |
+    | `workspace/.mantis_state.json` | Current `pass_number` and `active_snapshot` (root, `snapshot_id`, `snapshot_pinned`) |
+    | Target source files under `CODE_ROOT` | Code at `code_paths` locations with at least 15 lines of surrounding context |
+  </Tab>
+  <Tab title="Writes">
+    | Path | Purpose |
+    |------|---------|
+    | `workspace/findings/<id>.json` | Updated in-place: `production_viability`, `critic_reasoning`, and a `critic` history entry |
+    | `workspace/learnings.jsonl` | Append-only long-term memory entry for every processed finding (all statuses) |
+  </Tab>
+</Tabs>
+
+## Usage
+
+```
+/mantis-critic
+```
+
+Invoke without arguments for MODE-OFF (live tree, no snapshot pinning). The
+skill reads all findings, evaluates viability for `VALID` and
+`PROVISIONALLY_VALID` findings, logs all findings to long-term memory, and
+writes verdict fields in place.
+
+**With a pinned snapshot:**
+
+```
+/mantis-critic \
+  --snapshot_root=/tmp/mantis_snapshots/pass_3 \
+  --snapshot_id=abc123def456 \
+  --state_root=/workspace
+```
+
+## Production Viability Values
+
+`/mantis-critic` assigns one of four `production_viability` values to each
+qualifying finding:
+
+<CardGroup cols={2}>
+  <Card title="VIABLE" icon="circle-check">
+    The flaw is fully triggerable in a standard release/production build with no
+    special flags or non-default configuration required.
+  </Card>
+  <Card title="NON_VIABLE" icon="circle-xmark">
+    The flaw is unreachable or compiled-out in production. Includes bugs that
+    rely on `assert()` / `debug_abort()` where `NDEBUG` strips the crash path,
+    `#ifdef DEBUG`-only code, and paths blocked by non-configurable production
+    environmental controls (OS permissions, kernel sandboxing, read-only
+    filesystems).
+  </Card>
+  <Card title="SAMPLE_OR_TEST" icon="flask">
+    The issue resides in example code, test suites, fuzzing harnesses, or
+    validation frameworks that are not compiled into production targets.
+  </Card>
+  <Card title="CONDITIONAL_VIABLE" icon="triangle-exclamation">
+    The flaw is exploitable only under specific non-default configurations,
+    optional compiler flags, or custom hardening options that may vary across
+    production environments.
+  </Card>
+</CardGroup>
+
+<Note>
+  `NON_VIABLE` is the status that `/mantis-calibrate` drops from the final
+  report. It is never assigned due to a missing or drifted file — those cases
+  land on `CONDITIONAL_VIABLE` (the conservative branch) to prevent a
+  missing file from being misread as dead code.
+</Note>
+
+## Domain-Specific Viability Checks
+
+For each `VALID` or `PROVISIONALLY_VALID` finding, the critic reads at least
+**15 lines of preceding and succeeding context** around the designated line
+numbers, then applies class-specific analysis:
+
+<Tabs>
+  <Tab title="Memory Safety">
+    Locate the allocation source of the affected buffer. Determine whether it
+    is allocated with safety margins or trailing padding. If the out-of-bounds
+    access is contained within physical padding under all execution paths, the
+    finding is `NON_VIABLE`.
+  </Tab>
+  <Tab title="Logic & Authorization">
+    Verify that the flawed logic or bypassed endpoint is accessible in standard
+    production deployments. If the flaw relies on a debug-only backdoor, a mock
+    authentication provider, or a test-only route, it is `NON_VIABLE`.
+  </Tab>
+</Tabs>
+
+The critic also inspects `repro_hints` and `history` for empirical execution
+telemetry recorded by `/mantis-reproduce` — fields such as `build_profile`,
+`sanitizers_used`, `assertions_disabled`, and `ingress_blocked` — to
+corroborate release-build viability claims.
+
+## Snapshot Drift Handling
+
+For each `VALID` / `PROVISIONALLY_VALID` finding, the critic runs a **Block B
+Snapshot Match Check** comparing `F.discovery_commit` to the current
+`SNAPSHOT_ID`:
+
+- **MATCHED** → proceed to domain-specific viability analysis.
+- **NOT_MATCHED** (drift, missing file, or line out of range) → set
+  `production_viability = "CONDITIONAL_VIABLE"` with a drift note. The finding
+  is **never** marked `NON_VIABLE` due to drift alone — a missing file is not
+  evidence of dead code.
+
+<Warning>
+  In HALT mode (`active_snapshot` present, `snapshot_pinned = false`),
+  Block B always returns NOT_MATCHED. All findings in this mode land on
+  `CONDITIONAL_VIABLE`, never `NON_VIABLE`. This mirrors the
+  authoritative-verdict prohibition that applies to all stages in HALT.
+</Warning>
+
+## KB Freshness Gate
+
+When `workspace/kb/THREAT_MODEL.md` states the entire repository is exclusively
+a tutorial or test suite (`Intent: SAMPLE_OR_TEST_ONLY`), the critic may
+mass-mark all findings as `SAMPLE_OR_TEST`. This blanket action is gated on KB
+freshness:
+
+- **MODE-OFF** (no `active_snapshot`) — gate is skipped; mass-mark is
+  permitted as today.
+- **HALT or PINNED** — the KB's `KB_SNAPSHOT:` token (first line of the threat
+  model) must be present and byte-for-byte equal to the current `SNAPSHOT_ID`.
+  If it is missing, stale, or mismatched, the mass-mark is forbidden and every
+  finding is evaluated individually.
+
+## Long-Term Memory
+
+After processing, the critic appends one line per finding to
+`workspace/learnings.jsonl`:
+
+```json
+{
+  "title": "<security_flaw_title>",
+  "code_paths": ["<path:line>"],
+  "status": "<VIABLE | CONDITIONAL_VIABLE | NON_VIABLE | SAMPLE_OR_TEST | FALSE_POSITIVE | NEEDS_RESEARCH>",
+  "snapshot": "<current SNAPSHOT_ID>"
+}
+```
+
+This record allows `/mantis-plan` to avoid re-proposing research on already-
+evaluated files in subsequent passes.
+
+## Idempotency
+
+The skill checks whether a `"stage": "critic"` history entry already exists for
+the current pass before overwriting viability fields. It also checks
+`workspace/learnings.jsonl` to avoid writing duplicate records on re-runs.

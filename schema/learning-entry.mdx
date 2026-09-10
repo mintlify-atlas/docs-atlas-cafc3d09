@@ -1,0 +1,181 @@
+---
+title: "Learning Entry Schema — Mantis Knowledge Inbox"
+sidebarTitle: "Learning Entry"
+description: "Reference for workspace/learnings.jsonl — the ephemeral JSONL inbox of trajectory insights and finding outcomes consumed by /mantis-architecture each pass."
+---
+
+Learning entries are the feedback mechanism through which the Mantis pipeline accumulates institutional knowledge across pipeline passes. Each entry is a single JSON object on its own line (JSONL format) in one of two files: `workspace/learnings.jsonl` (the live, ephemeral inbox for the current loop) or `workspace/historical_learnings.jsonl` (the permanent append-only archive written by `/mantis-history`). The inbox is consumed and cleared by `/mantis-architecture` at the start of each architecture pass; the historical file persists across all passes and is read — never cleared — by `/mantis-summarize` and `/mantis-architecture` to enrich KB content with patterns from the repository's VCS history.
+
+The schema supports three `oneOf` variants, each identified by the shape of its fields: a `trajectory_insight` (keyed by the `type` discriminator), a `finding_outcome` (a `Finding Outcome Summary` keyed by `title` + `code_paths` + `status`), and a `historical_learning` entry (from VCS history, keyed by `revision_id`). The two most important for pipeline operation are `trajectory_insight` and `Finding Outcome Summary`, documented in detail below.
+
+<Info>
+  All entries in `learnings.jsonl` are ephemeral. Once `/mantis-architecture` reads and processes the inbox, it clears the file. Data worth retaining is synthesized into the permanent `workspace/kb/` Markdown documents. The `historical_learnings.jsonl` file is never cleared.
+</Info>
+
+---
+
+## Variant 1: Trajectory Insight
+
+A `trajectory_insight` entry records a structured observation about a **component, file, or subsystem** extracted from an agent's execution trajectory. It is used to update the Knowledge Base's understanding of the codebase — adding new entities, correcting stale information, or removing entries that are no longer valid.
+
+### Fields
+
+<ParamField body="type" type="string" required>
+  Discriminator field. Must be `"trajectory_insight"` to identify this variant.
+</ParamField>
+
+<ParamField body="action" type="enum" required>
+  The operation to apply to the `target_entity` in the Knowledge Base. One of:
+  - `add` — Record a new insight about this entity (entity is new or this insight is novel).
+  - `update` — Revise an existing insight about this entity (prior knowledge was incomplete or incorrect).
+  - `remove` — Mark a prior insight about this entity as no longer valid.
+</ParamField>
+
+<ParamField body="target_entity" type="string" required>
+  The component, file, or subsystem this insight is about (e.g., `"auth_module.py"`, `"JWT validation middleware"`, `"UserRepository.find_by_email"`).
+</ParamField>
+
+<ParamField body="insight" type="string" required>
+  A free-form description of the observation (e.g., `"The session token is generated using random.random() instead of secrets.token_bytes(), making it predictable."` or `"This file contains no external input handling — confirmed safe from injection."`).
+</ParamField>
+
+<ParamField body="source_stage" type="string" required>
+  The pipeline stage that produced this insight (e.g., `"researcher"`, `"reviewer"`, `"reproduce"`, `"critic"`).
+</ParamField>
+
+<ParamField body="snapshot" type="string">
+  The `SNAPSHOT_ID` this insight was observed against, stamped by `/mantis-reflect`. Optional. Absent → snapshot-agnostic or legacy insight (treated as valid for any snapshot).
+</ParamField>
+
+### Example JSONL line
+
+```jsonl
+{"type": "trajectory_insight", "action": "add", "target_entity": "src/crypto/token_generator.py", "insight": "Token generation uses random.random() (Mersenne Twister, not cryptographically secure) instead of secrets.token_bytes(). An observer who can collect ~624 consecutive tokens can reconstruct the PRNG state and predict all future tokens.", "source_stage": "researcher", "snapshot": "abc123def456789"}
+```
+
+---
+
+## Variant 2: Finding Outcome Summary
+
+A `Finding Outcome Summary` entry records the **finalized verdict** on a specific vulnerability finding — whether it was confirmed viable, dismissed as a false positive, patched, or determined to reside in non-production code. This information feeds back into the KB so that future passes do not re-investigate the same issue, and so that the Knowledge Base correctly reflects which areas of the codebase have known, verified security properties.
+
+This variant is written by `/mantis-critic` (for viability verdicts) and `/mantis-patch` (for patch outcomes), and by `/mantis-dedupe` when findings are merged.
+
+### Fields
+
+<ParamField body="title" type="string" required>
+  The `title` field of the finding this outcome summarizes.
+</ParamField>
+
+<ParamField body="code_paths" type="string[]" required>
+  The `code_paths` array from the finding — the exact file locations involved.
+</ParamField>
+
+<ParamField body="status" type="enum" required>
+  The finalized status. One of:
+  - `VIABLE` — The bug is confirmed triggerable in a production release build.
+  - `NON_VIABLE` — The bug is compiled out, blocked by the environment, or debug-only.
+  - `SAMPLE_OR_TEST` — The bug is in test or example code (non-production).
+  - `CONDITIONAL_VIABLE` — Exploitable only under specific non-default configurations.
+  - `FALSE_POSITIVE` — Not a real security bug or not in scope.
+  - `NEEDS_RESEARCH` — Inconclusive; still requires deeper review.
+  - `VERIFIED_SECURE` — The fix was verified to block the original exploit and ≥ 3 re-attack variants.
+  - `MITIGATION_PROPOSED` — A mitigation was suggested but not dynamically verified.
+  - `VERIFICATION_INCOMPLETE` — Patch verification was attempted but not completed.
+  - `VERIFICATION_FAILED` — The patch did not block the original exploit.
+  - `ERROR` — An unexpected error occurred during patch or verification.
+</ParamField>
+
+<ParamField body="patch_base_snapshot" type="string">
+  The `SNAPSHOT_ID` the patch was verified against (written by `/mantis-patch`). Optional. Absent → patch was applied without snapshot tracking (legacy mode).
+</ParamField>
+
+<ParamField body="snapshot" type="string">
+  The `SNAPSHOT_ID` at the time this learning entry was created. Written by `/mantis-critic` and `/mantis-patch`. Optional. Absent → snapshot-agnostic or legacy learning.
+</ParamField>
+
+### Example JSONL line
+
+```jsonl
+{"title": "SQL Injection in User Login Endpoint", "code_paths": ["src/api/auth_handler.py:87"], "status": "VERIFIED_SECURE", "patch_base_snapshot": "abc123def456789", "snapshot": "abc123def456789"}
+```
+
+---
+
+## Variant 3: Historical Learning Entry
+
+Historical learning entries are written exclusively by `/mantis-history` to `workspace/historical_learnings.jsonl` when it analyzes the repository's VCS commit history for past security fixes. These entries are never written to the ephemeral inbox — they are persisted permanently.
+
+<Accordion title="Historical Learning Entry Fields">
+  <ParamField body="revision_id" type="string" required>
+    The VCS commit hash or revision identifier where this historical finding was introduced or fixed.
+  </ParamField>
+
+  <ParamField body="title" type="string" required>
+    A short summary of the historical vulnerability or security fix.
+  </ParamField>
+
+  <ParamField body="description" type="string" required>
+    A detailed description of the historical bug or change.
+  </ParamField>
+
+  <ParamField body="code_paths" type="string[]" required>
+    The file paths involved in the historical bug or fix.
+  </ParamField>
+
+  <ParamField body="vuln_type" type="string" required>
+    The vulnerability class (e.g., `"SQL Injection"`, `"Buffer Overflow"`, `"SSRF"`).
+  </ParamField>
+
+  <ParamField body="mitigation_diff" type="string" required>
+    The unified diff of the fix as it appeared in the VCS history.
+  </ParamField>
+
+  <ParamField body="cve" type="string | null" required>
+    The CVE identifier if the historical bug was publicly disclosed, or `null` if no CVE was assigned.
+  </ParamField>
+
+  <ParamField body="history" type="object[]" required>
+    An array of `history_entry` objects (same schema as the `history` field on the Finding object) tracking when this entry was written.
+  </ParamField>
+</Accordion>
+
+---
+
+## How the Inbox Flows Through the Pipeline
+
+The `workspace/learnings.jsonl` inbox connects several pipeline stages in a feedback cycle that evolves the Knowledge Base across passes:
+
+<Steps>
+  <Step title="/mantis-reflect writes trajectory insights">
+    After each pipeline pass, `/mantis-reflect` (the Reflector skill) parses the execution trajectories of all agents from the current round. It extracts false assumptions that led to wasted work, tool failures, newly confirmed safe areas, and successful attack patterns. Each extracted observation is appended to `workspace/learnings.jsonl` as a `trajectory_insight` entry stamped with the current `SNAPSHOT_ID`.
+  </Step>
+  <Step title="/mantis-critic and /mantis-patch write finding outcomes">
+    During the pass itself, `/mantis-critic` appends a `Finding Outcome Summary` for each finding it marks `NON_VIABLE` or `FALSE_POSITIVE`. `/mantis-patch` appends a `Finding Outcome Summary` for each finding it processes, recording the `VERIFIED_SECURE`, `MITIGATION_PROPOSED`, or `VERIFICATION_FAILED` outcome alongside the `patch_base_snapshot`.
+  </Step>
+  <Step title="/mantis-architecture drains and consumes the inbox">
+    At the start of each new pass (after findings from the previous pass are archived), `/mantis-architecture` reads every entry in `workspace/learnings.jsonl`. It synthesizes the trajectory insights and finding outcomes into the permanent Markdown Knowledge Base at `workspace/kb/`, updating entity files, data flow descriptions, and known-safe annotations. After synthesis, it clears `workspace/learnings.jsonl` to start the next pass with a clean inbox.
+  </Step>
+  <Step title="/mantis-dedupe also reads the inbox">
+    Before `/mantis-architecture` runs, `/mantis-dedupe` reads `workspace/learnings.jsonl` to identify `Finding Outcome Summary` entries that confirm a previous finding is `FALSE_POSITIVE` or `NON_VIABLE`, helping it avoid merging active valid findings with dismissed ones.
+  </Step>
+</Steps>
+
+<Note>
+  `/mantis-summarize` and `/mantis-architecture` also read `workspace/historical_learnings.jsonl` (never the ephemeral inbox) to seed the KB with patterns from the repository's own past vulnerabilities. This persistent file is written once by `/mantis-history` and is never cleared or modified by any other stage.
+</Note>
+
+---
+
+## Both Variants in Context
+
+The following example shows how a single pipeline pass might produce entries of both types in `workspace/learnings.jsonl`:
+
+```jsonl
+{"type": "trajectory_insight", "action": "add", "target_entity": "src/crypto/token_generator.py", "insight": "Token generation uses random.random() (Mersenne Twister) — not cryptographically secure. PRNG state recoverable after ~624 observed tokens.", "source_stage": "researcher", "snapshot": "abc123def456789"}
+{"title": "Insecure Token Generation in session.py", "code_paths": ["src/crypto/token_generator.py:12"], "status": "VIABLE", "snapshot": "abc123def456789"}
+{"type": "trajectory_insight", "action": "add", "target_entity": "src/db/user_repository.py", "insight": "All database queries in this file use parameterized queries via the ORM — no injection vectors found during this pass.", "source_stage": "reviewer", "snapshot": "abc123def456789"}
+{"title": "Debug SQL Logging Enabled in Production", "code_paths": ["src/db/connection.py:45"], "status": "NON_VIABLE", "snapshot": "abc123def456789"}
+```
+
+When `/mantis-architecture` processes this inbox, it will update the KB entity file for `src/crypto/token_generator.py` with the PRNG insight (marking it as a confirmed vulnerability area), add a "known-safe" annotation to the `src/db/user_repository.py` entity file, and record the `NON_VIABLE` outcome so future passes skip re-investigating the debug logging finding.

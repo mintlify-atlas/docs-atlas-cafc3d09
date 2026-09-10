@@ -1,0 +1,224 @@
+---
+title: "Configure Sandbox Environments for Mantis"
+sidebarTitle: "Sandboxes"
+description: "Compare all four Mantis sandbox types—static-only, gVisor, microsandbox, and GCE—and configure the right one for your environment and threat model."
+---
+
+Every Mantis run that involves executing generated code — crash reproducers, patch verification scripts, or arbitrary build commands — does so inside an isolated sandbox environment. Choosing the right sandbox is one of the most important configuration decisions you will make: it determines what isolation guarantees you get, what dependencies are required, and whether dynamic reproduction stages run at all.
+
+The reference implementation supports four sandbox types, selectable via the `sandbox.type` field in `workflow.json` or with the `--sandbox` flag on the CLI. Each type is a pluggable environment class that implements the same `BaseEnvironment` interface (`execute`, `read_file`, `write_file`, `apply_patch`, `preflight`, `initialize`, `close`), so the pipeline code is identical regardless of which sandbox is active.
+
+## Sandbox Comparison
+
+<CardGroup cols={2}>
+  <Card title="static-only" icon="magnifying-glass">
+    **No execution — static analysis only.** Safe for any machine. The `/mantis-reproduce` and `/mantis-patch` dynamic stages are skipped. No Docker, no KVM, no `gcloud` required.
+  </Card>
+  <Card title="gvisor" icon="box">
+    **OCI container + gVisor `runsc` kernel.** Requires Docker or Podman with the `runsc` runtime registered. Runs `--network=none`. Strong process and kernel isolation without hardware virtualization.
+  </Card>
+  <Card title="microsandbox" icon="microchip">
+    **In-process hardware microVM via `libkrun`.** Requires `/dev/kvm` access. Uses `Network.none()` for strict network isolation. Full VM isolation without cloud infrastructure.
+  </Card>
+  <Card title="gce" icon="cloud">
+    **Hardened ephemeral GCE VM.** Requires `gcloud` CLI and a GCP project. Private VPC, no external IP, IAP-only ingress, DNS blackholing, active isolation audit probes, and Shielded VM. The strongest isolation option.
+  </Card>
+</CardGroup>
+
+## Sandbox Details
+
+<Accordion title="static-only — Static Analysis, No Execution">
+  The `StaticOnlyEnvironment` is a no-op sandbox. It reads the target files from the host filesystem for static analysis but disables all dynamic execution. Any call to `execute()` returns exit code `127` with the message `SANDBOX-UNAVAILABLE: static-only sandbox; dynamic execution is disabled`. Any call to `apply_patch()` returns a similar unavailability notice.
+
+  **When to use:** When you want to run the full static analysis pipeline (`/mantis-history` through `/mantis-critic`) without the dynamic reproduction and patching stages. This is safe on any machine, requires no additional software, and is the appropriate starting point when you cannot install Docker, do not have KVM access, and do not have a GCP project.
+
+  **Trade-offs:**
+  - ✅ No dependencies, always available
+  - ✅ Zero host execution risk
+  - ❌ `/mantis-reproduce` and `/mantis-patch` are skipped
+  - ❌ No dynamic verification of findings
+</Accordion>
+
+<Accordion title="gvisor — OCI Container + runsc Kernel">
+  The `GvisorEnvironment` runs each analysis task inside a Docker or Podman OCI container executed under the gVisor `runsc` runtime. The container is created with `--network=none` and `--runtime=runsc`, ensuring both kernel-level isolation and zero network access. Target code is copied into the container's `/workspace` directory at initialization; the host filesystem is never mounted.
+
+  **When to use:** When you want dynamic crash reproduction and patch verification on your local machine or CI server. gVisor provides strong isolation without hardware virtualization — it interposes on system calls rather than running a full VM.
+
+  **Prerequisites:**
+  1. Docker (`docker`) or Podman (`podman`) installed and running
+  2. gVisor `runsc` registered as a Docker/Podman runtime:
+
+  ```bash
+  # Register runsc with --network=none
+  sudo runsc install -- --network=none && sudo systemctl restart docker
+  ```
+
+  Or add it manually to `/etc/docker/daemon.json`:
+
+  ```json
+  {
+    "runtimes": {
+      "runsc": {
+        "path": "runsc",
+        "runtimeArgs": ["--network=none"]
+      }
+    }
+  }
+  ```
+
+  3. The `mantis-sandbox:latest` image built locally (run `./reference/install.sh`)
+
+  **Trade-offs:**
+  - ✅ Strong kernel-level isolation
+  - ✅ No hardware virtualization required
+  - ✅ Works on most Linux development machines and CI
+  - ❌ Requires Docker/Podman + gVisor installation
+  - ❌ Not available in restricted cloud environments without container runtimes
+</Accordion>
+
+<Accordion title="microsandbox — In-Process Hardware MicroVM">
+  The `MicrosandboxEnvironment` creates an ephemeral Linux microVM using `libkrun` (via the `microsandbox` Python package). Each task gets a fresh VM initialized with `Network.none()` — strictly no egress, no DNS, no metadata endpoint access. Target code is copied into the guest `/workspace` directory using the microVM's filesystem API.
+
+  **When to use:** When you want full VM-level isolation without cloud infrastructure. Microsandbox is faster to start than a full GCE VM and requires no internet connection, making it suitable for offline development and local CI pipelines on Linux.
+
+  **Prerequisites:**
+  1. Linux with `/dev/kvm` readable and writable:
+     ```bash
+     # Add your user to the kvm group
+     sudo usermod -aG kvm $USER
+     # Verify access
+     ls -la /dev/kvm
+     ```
+  2. The `microsandbox` Python package and `mantis-sandbox:latest` image (installed via `./reference/install.sh`)
+
+  **Trade-offs:**
+  - ✅ Full VM-level isolation
+  - ✅ No cloud account required
+  - ✅ Fast startup relative to GCE
+  - ❌ Requires KVM-enabled Linux kernel
+  - ❌ Not available on macOS or Windows
+  - ❌ Requires `/dev/kvm` access (may not be available in nested virtualization)
+</Accordion>
+
+<Accordion title="gce — Hardened Ephemeral GCE VM">
+  The `GceEnvironment` provisions a fresh, hardened GCE VM instance for each pipeline run and deletes it when the run completes. The VM is created with no external IP address (`--no-address`), no service account (`--no-service-account --no-scopes`), Shielded VM features (`--shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring`), and a cloud-enforced TTL (`--max-run-duration`). Communication is exclusively through an IAP SSH tunnel. An active in-guest isolation probe verifies containment before any generated code executes.
+
+  **When to use:** For unattended production deployments, continuous 24/7 review loops, and any environment where the strongest isolation guarantee is required. See [Deploy Mantis Unattended on GCE](/guides/unattended-gce-deployment) for the full network and IAM hardening guide.
+
+  **Prerequisites:**
+  1. `gcloud` CLI installed and authenticated
+  2. An active GCP project with the Compute Engine API enabled
+  3. A private VPC and subnet configured (see the GCE deployment guide)
+  4. A golden disk image with build dependencies pre-installed (required because the isolated VPC has no internet access)
+
+  **Trade-offs:**
+  - ✅ Strongest isolation: hypervisor-level, dedicated GCP VM
+  - ✅ Active containment verification at startup
+  - ✅ Auto-deleted after run (ephemeral, no persistent attack surface)
+  - ❌ Requires GCP project and `gcloud` CLI
+  - ❌ Slowest to start (~60–120 seconds VM boot)
+  - ❌ Requires pre-built golden image with all dependencies
+</Accordion>
+
+## Configuring the Sandbox in workflow.json
+
+The sandbox is configured under the `config.sandbox` key in `workflow.json`. The `type` field selects the implementation; the `options` object passes constructor arguments to the sandbox class.
+
+<Tabs>
+  <Tab title="static-only">
+    ```json
+    {
+      "config": {
+        "sandbox": {
+          "type": "static-only"
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="gvisor">
+    ```json
+    {
+      "config": {
+        "sandbox": {
+          "type": "gvisor",
+          "options": {
+            "image": "mantis-sandbox:latest",
+            "runtime": "runsc",
+            "workdir": "/workspace",
+            "timeout_seconds": 30
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="microsandbox">
+    ```json
+    {
+      "config": {
+        "sandbox": {
+          "type": "microsandbox",
+          "options": {
+            "image": "mantis-sandbox:latest",
+            "workdir": "/workspace",
+            "timeout_seconds": 30
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="gce">
+    ```json
+    {
+      "config": {
+        "sandbox": {
+          "type": "gce",
+          "options": {
+            "project": "YOUR_PROJECT_ID",
+            "zone": "us-central1-b",
+            "image": "mantis-sandbox-image",
+            "subnet": "mantis-isolated-subnet",
+            "workdir": "/workspace",
+            "tunnel_through_iap": true,
+            "no_service_account": true,
+            "no_external_ip": true,
+            "verify_isolation": true,
+            "timeout_seconds": 600
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Local developer overrides go in `workflow.local.json`, not `workflow.json`. The `workflow.local.json` file is gitignored and takes precedence over the tracked template. Use `configure.py --save` to write to the local overlay automatically.
+</Note>
+
+## Using the configure.py Script
+
+The `configure.py` script provides a convenient way to set the sandbox without editing JSON directly. It writes the selected configuration to `workflow.local.json`.
+
+```bash
+# Switch to static analysis only (zero dependencies)
+python3 reference/scripts/configure.py --sandbox static-only
+
+# Configure gVisor with a specific image
+python3 reference/scripts/configure.py --sandbox gvisor --image mantis-sandbox:latest
+
+# Configure GCE with your project and zone
+python3 reference/scripts/configure.py --sandbox gce \
+    --project my-gcp-project \
+    --zone us-central1-b
+
+# Auto-detect and configure the best available sandbox
+python3 reference/scripts/configure.py --auto
+
+# Verify the selected sandbox is operational (~1s)
+python3 reference/scripts/configure.py --test
+```
+
+The `--auto` flag inspects the host for available capabilities — `/dev/kvm` for microsandbox, `docker`/`runsc` for gVisor, `gcloud` with an active project for GCE — and selects the best option, falling back to `static-only` if nothing else is available.

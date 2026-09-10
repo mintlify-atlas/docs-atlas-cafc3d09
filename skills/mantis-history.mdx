@@ -1,0 +1,130 @@
+---
+title: "/mantis-history: VCS Vulnerability History Extraction"
+sidebarTitle: "/mantis-history"
+description: "Analyzes VCS commit history to extract past vulnerabilities and security fixes, writing a structured historical learnings database for downstream skills."
+---
+
+The `/mantis-history` skill mines your repository's version control history for security-relevant commits — past vulnerabilities, security patches, and associated file changes — and distills them into a structured JSONL database that informs every subsequent stage of the pipeline. Run it as an initial pre-processing step, before threat modeling or research, to give downstream skills awareness of historically problematic code paths. Do not use it for code review, writing test scripts, or patching code.
+
+## Command
+
+```
+/mantis-history [--snapshot_root <dir>] [--snapshot_id <id>] [--state_root <dir>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Absolute path to the pinned, read-only code snapshot. History reads VCS logs from the **live** repository root (not the snapshot), but uses this to locate the target tree.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The snapshot identifier for this pass. Stamped into each extracted entry's `history` provenance block.
+</ParamField>
+
+<ParamField path="--state_root" type="string" optional>
+  Parent directory of `workspace/`. Cache, output JSONL, and extraction scripts are written here — never into the target tree. When absent, defaults to `./workspace/` relative to the current directory (MODE-OFF / degraded behavior).
+</ParamField>
+
+<Note>
+  **All flags absent → DEGRADED mode.** The skill behaves as if it was launched from the current working directory: it reads VCS logs from `cwd` and writes all output to `./workspace/`. Downstream stages still consume the output normally.
+</Note>
+
+## Input / Output Contract
+
+### Reads
+
+| Path | Purpose |
+|------|---------|
+| `workspace/.mantis_state.json` | Reads current loop pass number for provenance stamping |
+| Live repository root (`.git` / `.hg` / `.repo`) | VCS log extraction — always the **live** root, not the snapshot |
+| Codebase directory structure and key files | Determines the technology stack and relevant security keywords |
+| `mantis-summary.md` (optional) | Enriches keyword selection when available |
+| Internal history analysis cache | Enables incremental extraction on re-runs |
+
+### Writes
+
+| Path | Content |
+|------|---------|
+| `workspace/historical_learnings.jsonl` | Extracted historical vulnerability records (one JSON object per line) |
+| `workspace/` (VCS extraction script) | On-the-fly generated script; written and executed at runtime |
+| Internal history analysis cache | Maps `revision_id → analyzed` with high-water mark; never wiped while non-empty |
+| `history_status` marker | Optional sidecar: `UNSUPPORTED_VCS` or `PARTIAL_SHALLOW` |
+
+<Warning>
+  The pinned snapshot copy **strips** `.git`/`.hg`/`.repo` metadata. Every VCS log, diff, and blame command **must** run against the live repository root, not `CODE_ROOT`. The skill will not stop if `CODE_ROOT` lacks VCS metadata — this is expected.
+</Warning>
+
+## Historical Learnings Schema
+
+Each line of `workspace/historical_learnings.jsonl` follows this structure:
+
+```json
+{
+  "revision_id": "abc123",
+  "title": "Fix buffer overflow in parse_input()",
+  "description": "...",
+  "code_paths": ["src/parser.c:87"],
+  "vuln_type": "Buffer Overflow",
+  "mitigation_diff": "...",
+  "cve": "CVE-2023-12345",
+  "history": [
+    {
+      "stage": "history_extractor",
+      "action": "created",
+      "details": "Extracted from repository revision history.",
+      "pass_number": 1,
+      "timestamp": "2024-01-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+## Usage
+
+### Standalone invocation (MODE-OFF)
+
+```bash
+/mantis-history
+```
+
+### With snapshot and state root (orchestrated)
+
+```bash
+/mantis-history \
+  --snapshot_root /tmp/mantis/snapshots/snap_abc \
+  --snapshot_id snap_abc \
+  --state_root /tmp/mantis/state
+```
+
+## Notes
+
+<Accordion title="Idempotency and cache behavior">
+  The internal cache is the **source of truth**. On every run, `workspace/historical_learnings.jsonl` is rebuilt from the cache — the output DB is never truncated to empty while the cache is non-empty. Only commits newer than the `_analyzed_head` high-water mark are analyzed on re-runs.
+
+  Cache invalidation is triggered by:
+  - A VCS history rewrite (force-push, rebase, squash) where `_analyzed_head` is no longer reachable
+  - A change in `vcs_type` or repository identity
+
+  When invalidated, extraction starts from scratch.
+</Accordion>
+
+<Accordion title="Unsupported and shallow VCS">
+  **Unsupported VCS (`none` / `unknown`):** The skill writes an empty `workspace/historical_learnings.jsonl`, sets `history_status = "UNSUPPORTED_VCS"`, and exits cleanly. It never fabricates history.
+
+  **Shallow git clone:** The skill proceeds but sets `history_status = "PARTIAL_SHALLOW"`. Downstream stages must **not** interpret the absence of historical findings for a file as a clean signal — the history may simply be truncated.
+
+  **Multi-VCS (`.repo`):** The skill either iterates history per sub-project or writes the empty file with `history_status = "UNSUPPORTED_VCS"`.
+</Accordion>
+
+<Accordion title="Cost efficiency optimizations">
+  The generated extraction script applies several optimizations to keep API costs bounded:
+
+  - **Commit pre-filtering:** Only commits whose messages match security/bug keywords are fetched for diff retrieval. Keywords are tailored to the detected technology stack.
+  - **Diff size limits:** Commits with excessively large diffs (e.g., automated formatting changes) are skipped.
+  - **Non-production exclusions:** Commits touching only tests, documentation, or configuration files are ignored.
+  - **Batched LLM calls:** Multiple commit diffs are batched (3–5 per call) into a single LLM request, which returns a JSON array of findings.
+  - **Model tiering:** Lightweight models handle initial filtering; heavier models are used only for deeper verification of suspected vulnerabilities.
+</Accordion>
+
+<Accordion title="Pipeline position">
+  `/mantis-history` is an **initial pre-processing step**. Run it before `/mantis-summarize`, `/mantis-architecture`, `/mantis-threat-model`, `/mantis-plan`, and `/mantis-researcher`. Its output (`workspace/historical_learnings.jsonl`) is consumed by `/mantis-summarize` to enrich directory summaries and by `/mantis-architecture` to populate vulnerability pattern KB entries.
+</Accordion>

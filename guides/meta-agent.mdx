@@ -1,0 +1,130 @@
+---
+title: "Orchestrate Continuous Reviews with Meta-Agent"
+sidebarTitle: "Meta-Agent"
+description: "Use /mantis-meta-agent as a persistent supervisor to run continuous security review campaigns with snapshot pinning, GC, and Pub/Sub alerting."
+---
+
+The `/mantis-meta-agent` skill transforms Mantis from a set of discrete slash commands into a continuous, self-driving security research operation. A high-level Meta-Agent — a long-lived coding agent session — acts as a persistent supervisor that drives the entire reviewing pipeline, monitors execution, handles minor environmental errors, and loops indefinitely so reviews continue while you are away.
+
+<Warning>
+  Running the Meta-Agent with auto-approval flags (`--dangerously-skip-permissions` or `--yolo`) requires a [fully hardened GCE environment](/guides/unattended-gce-deployment) with VPC isolation, no external internet access, and restricted IAM roles. Never enable unattended mode on a machine with access to production systems or sensitive networks.
+</Warning>
+
+## What the Meta-Agent Does
+
+The Meta-Agent is the `#1` node in the pipeline architecture — a persistent orchestrator that launches and supervises the continuous review loop.
+
+<CardGroup cols={2}>
+  <Card title="Orchestration" icon="sitemap">
+    Manages the execution of each pipeline stage natively using CLI subagent delegation. Drives the full skill sequence from `/mantis-history` through `/mantis-report` and back.
+  </Card>
+  <Card title="Persistence" icon="clock">
+    Operates in a single long-lived conversation spanning days or weeks, ensuring the review continues working toward vulnerability discovery and patching while you are unavailable.
+  </Card>
+  <Card title="Supervision" icon="eye">
+    Monitors task health, handles minor environmental issues, reads logs, and ensures the pipeline stays operational. Archives the `workspace/findings/` directory between loop iterations.
+  </Card>
+  <Card title="Interactive Steering" icon="comments">
+    You can chat with the Meta-Agent while subagents are working. Ask for status updates, debug environment issues, or provide strategic guidance (e.g., "Deep dive on the image parser") to shift the swarm's focus in real time.
+  </Card>
+</CardGroup>
+
+## The Loop Lifecycle
+
+Each pass the Meta-Agent runs follows a defined lifecycle. Understanding this lifecycle is important for configuring boundary sync and snapshot pinning correctly.
+
+<Steps>
+  <Step title="Archive Findings">
+    At the start of a new pass, the Meta-Agent archives the previous pass's `workspace/findings/` directory so it is empty and ready for fresh output. Boundary sync is only triggered when the findings directory is empty, ensuring no in-flight finding is stranded across a code change.
+  </Step>
+  <Step title="Sync (opt-in)">
+    If `--sync` is passed, the Meta-Agent performs a non-destructive fast-forward sync of the target codebase. Sync is skipped entirely if the tree is dirty, ahead of upstream, on a detached HEAD, or has no upstream. It never runs `git reset --hard`, `git checkout -- .`, or `git clean`. If sync succeeds and the code has changed, the Knowledge Base is stale and must be refreshed.
+
+    ```text
+    /mantis-meta-agent --sync
+    ```
+
+    <Note>
+      The default `state_root` when using `--sync` is the current working directory. If this is inside the target repository, pass `--state_root=<path outside the target>` to avoid the colocated-state hazard described in the Pipeline Adapter guide (Scenario 1).
+    </Note>
+  </Step>
+  <Step title="Pin Snapshot">
+    The orchestrator materializes an isolated, read-only copy of the target — a `git worktree` or full copy — under `.mantis_snapshots/`. It writes a sentinel `.mantis_snapshot_id` into the copy and records `active_snapshot` in state. Every subsequent stage in this pass reads code through this pinned root, so edits made mid-pass are ignored.
+  </Step>
+  <Step title="Force-Refresh the Knowledge Base">
+    If a sync occurred and the codebase changed, the Meta-Agent re-runs `/mantis-architecture` before planning the new pass. This ensures the Knowledge Base reflects the updated code and prevents the planner from analyzing stale paths.
+  </Step>
+  <Step title="Run the Full Pipeline">
+    The Meta-Agent drives the complete skill sequence: `/mantis-history` → `/mantis-structural-index` → `/mantis-summarize` → `/mantis-architecture` → `/mantis-threat-model` → `/mantis-plan` → `/mantis-researcher` → `/mantis-dedupe` → `/mantis-review` → `/mantis-critic` → `/mantis-reproduce` → `/mantis-chain` → `/mantis-patch` → `/mantis-calibrate` → `/mantis-reflect` → `/mantis-report`.
+  </Step>
+  <Step title="Report and Loop">
+    After `/mantis-report` generates the review packet, the Meta-Agent reports findings (optionally publishing high-confidence discoveries to a Pub/Sub topic), then loops back to the archive step for the next pass.
+  </Step>
+</Steps>
+
+## Snapshot Pinning and the `--sync` Flag
+
+The snapshot model is **opt-in and default off**. Without `--sync` and without snapshot arguments, the Meta-Agent runs in MODE-OFF — a point-in-time review of the current directory with all verdicts permitted and no snapshot freezing.
+
+Passing `--sync` enables the snapshot-per-pass model:
+
+- Each pass gets its own immutable `SNAPSHOT_ID` computed from VCS state (clean git → `commit_hash`, dirty → `commit_hash:content_hash`, no VCS → `content:<sha256>`)
+- Findings record a `discovery_commit` field tied to the snapshot they were found against
+- Deduplication, false-positive filtering, and patching decisions only proceed when a finding's `discovery_commit` exactly equals the current `SNAPSHOT_ID`
+- A finding discovered against a different snapshot is re-researched rather than silently filtered
+
+If `--sync` is requested but the snapshot cannot be pinned (live endpoint, copy failure, racing dirty tree), the pass runs in **HALT** mode: degraded, non-authoritative results with no `VERIFIED_SECURE` or `failed_to_reproduce` verdicts emitted.
+
+## Snapshot Garbage Collection with `--snapshot_keep`
+
+Each pinned snapshot consumes disk space under `.mantis_snapshots/`. Use `--snapshot_keep=N` to limit how many historical snapshots are retained:
+
+```text
+/mantis-meta-agent --sync --snapshot_keep=3
+```
+
+This retains the three most recent snapshots and deletes older ones. Setting `N=1` keeps only the current pass's snapshot. The default retains all snapshots.
+
+## Pub/Sub Alerting for Unattended Notifications
+
+When the Meta-Agent is running unattended, you can configure it to publish high-confidence findings to a Google Cloud Pub/Sub topic so your team is notified immediately without polling the review output.
+
+<Steps>
+  <Step title="Create the Pub/Sub Topic">
+    ```bash
+    gcloud pubsub topics create mantis-verified-vulns \
+        --project=YOUR_PROJECT_ID
+    ```
+  </Step>
+  <Step title="Grant Publisher Role to the VM Service Account">
+    ```bash
+    gcloud pubsub topics add-iam-policy-binding mantis-verified-vulns \
+        --project=YOUR_PROJECT_ID \
+        --member="serviceAccount:mantis-runner@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+        --role="roles/pubsub.publisher"
+    ```
+  </Step>
+  <Step title="Instruct the Meta-Agent to Publish">
+    You can instruct the Meta-Agent to publish whenever a finding is successfully reproduced:
+
+    ```bash
+    gcloud pubsub topics publish mantis-verified-vulns \
+        --message="$(cat workspace/findings/<id>.json)"
+    ```
+
+    The Meta-Agent runs this command natively after each successful reproduction.
+  </Step>
+  <Step title="Subscribe a Cloud Function for Routing">
+    Subscribe a Google Cloud Function or Cloud Run service to the Pub/Sub topic to route the alert payload into your team's chat system, issue tracker, or on-call paging platform. This cleanly decouples the isolated scanning environment from your internal alerting infrastructure.
+  </Step>
+</Steps>
+
+<Info>
+  Because the GCE sandbox VM must have no external internet access, the Pub/Sub publishing path uses the internal Google API endpoint rather than the public `pubsub.googleapis.com`. Ensure your GCE VM's IAM service account has `roles/pubsub.publisher` and that internal Google APIs are accessible (or configure Private Google Access for the Pub/Sub API specifically, carefully scoped to avoid opening a broader egress path).
+</Info>
+
+## Non-Determinism and Loop Calibration
+
+The Meta-Agent leverages the AI's non-determinism constructively: each pass shifts the model's attention and may catch subtle issues missed in previous passes. However, finding quality eventually degrades as the model runs out of genuine issues and starts hallucinating.
+
+Monitor the Risk Calibrator scores across passes and pause the loop when the average score of new findings drops below your threshold. There is no universal stopping criterion — experiment with your specific codebase and model combination to determine what "diminishing returns" looks like for your environment.

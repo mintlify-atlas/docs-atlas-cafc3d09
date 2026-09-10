@@ -1,0 +1,276 @@
+---
+title: "How the Mantis Vulnerability Review Pipeline Executes"
+sidebarTitle: "Pipeline Flow"
+description: "A stage-by-stage breakdown of Mantis's sequential execution order, workspace paths, finding status transitions, and the patch re-attack bypass loop."
+---
+
+The Mantis pipeline is fundamentally sequential: each stage consumes the output files written by the previous stage and produces new or updated files for the next. This document walks through every stage in execution order, specifying exactly what each stage reads, what it writes, and how findings evolve from raw candidates through to patched, risk-calibrated vulnerabilities. Understanding this flow is essential for debugging stuck pipelines, building custom harnesses, and knowing where to inject external data like SAST findings.
+
+## Optional vs. Required Stages
+
+Before diving into execution order, it is important to distinguish optional pre-processing stages from the required analytical core.
+
+<Tabs>
+  <Tab title="Optional Stages">
+    These three stages enrich downstream analysis but are not required for a valid pipeline run. They are most valuable on large, long-lived codebases where VCS history and semantic indexing provide material context savings.
+
+    | Stage | When to include |
+    |---|---|
+    | `history` | When the repository has a meaningful VCS history of security fixes or CVEs |
+    | `structural-index` | When the codebase is large enough that grep-based call-site discovery is unreliable |
+    | `summarize` | When you want per-directory reference maps to speed up planning and architecture |
+  </Tab>
+  <Tab title="Required Stages">
+    These stages form the mandatory analytical core. Skipping any of them breaks the inter-stage data contract and will cause downstream stages to fail or produce incorrect results.
+
+    `architecture` → `threat-model` → `plan` → `researcher` → `dedupe` → `review` → `critic` → `reproduce` → `chain` → `patch` → `calibrate` → `reflect` → `report`
+  </Tab>
+</Tabs>
+
+## Full Sequential Execution Order
+
+### Stage 0a — `/mantis-history` *(optional)*
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** VCS log (git/hg), existing `mantis-summary.md` files if present
+
+  **Writes:** `workspace/historical_learnings.jsonl`
+
+  **What it does:** Walks the repository's commit history to extract past vulnerability fixes, CVE references, and security-relevant change patterns. Each entry in `historical_learnings.jsonl` is a JSON object conforming to the `learning_entry / Historical Learning Entry` schema variant in `schema.json` and includes `revision_id`, `title`, `description`, `vuln_type`, `mitigation_diff`, and optional `cve`.
+</Accordion>
+
+### Stage 0b — `/mantis-structural-index` *(optional)*
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** Source tree under `CODE_ROOT` (or the pinned `--snapshot_root`)
+
+  **Writes:**
+  - `workspace/kb/structural_index/manifest.json` — index metadata
+  - `workspace/kb/structural_index/catalog.sqlite` — queryable symbol catalog
+  - `workspace/kb/structural_index.jsonl` — compatibility pointer
+  - `workspace/helpers/query_structural_index.py` — bounded, paginated query helper
+
+  **What it does:** Builds a content-addressed index of semantic units (functions, classes, exports) using capability-based backend selection. The ladder is: prebuilt SCIP/Kythe → compiler → AST parser → ctags → regex → grep. The index is **hint-only** — it never gates findings, and any stage that cannot load it falls back to grep automatically.
+</Accordion>
+
+### Stage 1 — `/mantis-summarize` *(optional)*
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** Directory trees; `workspace/historical_learnings.jsonl` (if present)
+
+  **Writes:** `mantis-summary.md` in each scanned directory
+
+  **What it does:** Generates human-readable directory maps enriched with historical vulnerability context. The Strategist (`/mantis-plan`) reads these summaries to skip areas that have already been exhaustively analyzed in prior passes.
+</Accordion>
+
+### Stage 2 — `/mantis-architecture`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** Full source tree; `workspace/learnings.jsonl` (cleared after read); `workspace/historical_learnings.jsonl`; `mantis-summary.md` files
+
+  **Writes:** `workspace/kb/` — a Markdown Knowledge Base covering entities, data flows, trust boundaries, and historical vulnerability classes. Also **clears** `workspace/learnings.jsonl` after ingesting its ephemeral insights.
+
+  **What it does:** This is the foundational stage. It synthesizes everything Mantis knows about the codebase into a permanent, interlinked KB. Every subsequent analytical stage reads from `workspace/kb/` for context. Re-running this stage after a boundary sync is mandatory to keep the KB current.
+</Accordion>
+
+### Stage 3 — `/mantis-threat-model`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/kb/` (all entities and data-flow documents)
+
+  **Writes:** `workspace/kb/THREAT_MODEL.md` — creates or updates the living threat model
+
+  **What it does:** Evaluates the KB to establish trust boundaries, attacker profiles, and high-risk assets. The threat model must include a System Overview, Deployment Intent (`PRODUCTION` or `SAMPLE_OR_TEST_ONLY`), Trust Boundaries, Threat Actors, and High-Risk Assets. Downstream stages (`/mantis-review`, `/mantis-critic`, `/mantis-calibrate`) all read this file to make context-aware decisions.
+</Accordion>
+
+### Stage 4 — `/mantis-plan`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/kb/`; `mantis-summary.md` files; `workspace/kb/THREAT_MODEL.md`
+
+  **Writes:** `workspace/plan.json`
+
+  **What it does:** Builds a targeted scanning roadmap as an array of `investigations`, each with `title`, `target_files`, `kb_references`, and a `question` — detailed prompting instructions for the Researcher. The `kb_references` field injects specific KB file paths into the Researcher's context window, preventing it from re-reading the entire codebase for each investigation.
+</Accordion>
+
+```json title="workspace/plan.json structure"
+{
+  "investigations": [
+    {
+      "title": "Exhaustive Review: src/api/auth.py",
+      "target_files": ["src/api/auth.py", "src/models/user.py"],
+      "kb_references": [
+        "workspace/kb/entities/auth_module.md",
+        "workspace/kb/THREAT_MODEL.md"
+      ],
+      "question": "Review for authentication bypass, session fixation, and privilege escalation. Focus on token validation logic."
+    }
+  ]
+}
+```
+
+### Stage 5 — `/mantis-researcher`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/plan.json`; `workspace/kb/` (via `kb_references`); source files listed in each investigation's `target_files`
+
+  **Writes:** `workspace/findings/<uuid>.json` — one file per discovered vulnerability
+
+  **What it does:** Executes file-by-file triage and deep security flaw reviews. Each created finding file starts with `status: PROVISIONALLY_VALID` or `NEEDS_RESEARCH` and includes `id`, `title`, `description`, `code_paths`, `impact`, `severity`, `mitigation`, `attacker_position`, `privileges_required`, and `user_interaction`. The `discovery_commit` field is written once here and preserved verbatim across all subsequent retries.
+</Accordion>
+
+### Stage 6 — `/mantis-dedupe`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json`; `workspace/learnings.jsonl`
+
+  **Writes:** `workspace/findings/` — merges duplicates, deletes redundant files, updates `status` to `DUPLICATE` with a `duplicate_of` pointer on merged records
+
+  **What it does:** Groups overlapping findings by comparing file paths, vulnerability titles, and (when available) the finding's `signature` field — a stable hash of `normalized_title + cwe + primary_target`. In the ADK reference, a 3-tier deduplication ladder is used: exact heuristic anchors (less than 1ms), LLM-based root cause normalization, and semantic vector embeddings with cosine similarity greater than or equal to 0.90.
+</Accordion>
+
+### Stage 7 — `/mantis-review`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json` (all non-DUPLICATE findings); `workspace/kb/THREAT_MODEL.md`; source files referenced in each finding
+
+  **Writes:** `workspace/findings/<id>.json` — updates `status`, adds `reasoning` and `triage_checklist`
+
+  **What it does:** Applies a strict set of negative validation rules to filter false positives. Each finding that passes review is promoted to `VALID`. Each rejected finding is marked `FALSE_POSITIVE`. The `triage_checklist` records the evaluation outcome (`PASS`/`FAIL`/`UNKNOWN`/`NOT_APPLICABLE`) of each constraint, providing an audit trail. Customize the negative rules in this skill to match your codebase's idioms.
+</Accordion>
+
+### Stage 8 — `/mantis-critic`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json` (status `VALID`); `workspace/kb/THREAT_MODEL.md`; source files
+
+  **Writes:** `workspace/findings/<id>.json` — updates `production_viability`, `critic_reasoning`; appends `workspace/learnings.jsonl`
+
+  **What it does:** Verifies that each `VALID` finding is triggerable in a production release build — not in debug-only code paths, test suites, or behind compile-time guards. Findings that fail this check receive `production_viability: NON_VIABLE` or `SAMPLE_OR_TEST` and their outcome is appended to `workspace/learnings.jsonl` for future passes.
+</Accordion>
+
+### Stage 9 — `/mantis-reproduce`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json` (status `VALID`, production_viability `VIABLE`); source files; `workspace/kb/THREAT_MODEL.md`
+
+  **Writes:** `workspace/findings/<id>.json` — updates `repro_status`, `repro_file_path`, `run_command`, `repro_output`; writes PoC scripts to disk
+
+  **What it does:** Attempts to write and execute a Proof-of-Concept reproduction script using a tiered iterative strategy: unit micro-harness → functional subsystem → full sandboxed service. PoC scripts execute only inside isolated environments (`--network none`). The `repro_status` value is set to `reproduced` only when reached-sink evidence is present; absent evidence routes to `not_attempted` (retry-eligible), never `failed_to_reproduce`.
+</Accordion>
+
+<Warning>
+`repro_status: failed_to_reproduce` means a valid harness reached the vulnerability's execution sink but the bug did not trigger. It does **not** mean the vulnerability is unexploitable — only that this specific reproduction attempt did not succeed.
+</Warning>
+
+### Stage 10 — `/mantis-chain`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json` (reproduced or statically confirmed findings); `workspace/kb/`
+
+  **Writes:** New `workspace/findings/<uuid>.json` files — "Super Findings" with `constituent_findings` arrays listing the UUIDs of chained vulnerabilities
+
+  **What it does:** Identifies multi-step exploit chains by combining individually validated findings. Chain findings are `statically_confirmed` when all constituent findings have been individually confirmed. The pipeline does **not** attempt to write or execute end-to-end reproduction scripts for chains — only the individual constituent findings are reproduced.
+</Accordion>
+
+### Stage 11 — `/mantis-patch`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json` (reproduced findings); source files
+
+  **Writes:** `workspace/findings/<id>.json` — updates `patch_status`, `patch_diff`, `reattack_status`, `reattack_variants`; modifies source files in the patched shadow; appends `workspace/learnings.jsonl`
+
+  **What it does:** Generates minimal code fixes and applies them to a patched shadow of the codebase. After patching, runs post-patch validation and then executes a **variant-hunting re-attack**: an independent re-attack agent authors N ≥ 3 boundary-mutated variant inputs (off-by-one bounds, alternate paths to the same sink, sign flips). The patched shadow must survive **all** variants before `patch_status: VERIFIED_SECURE` is set.
+</Accordion>
+
+#### The Re-attack Bypass Loop
+
+When a patch is applied but the re-attack reveals a bypass, the `repro_classifier` in the ADK reference routes the finding back to the Reproducer for another attempt, up to `max_visits: 2`:
+
+```text
+reproducer → repro_classifier → (success) → chainer → patcher
+                              ↑                               |
+                              └───── (retry, max 2 times) ────┘
+                              → (exceeded) → calibrator
+```
+
+<Note>
+The `VERIFIED_SECURE` verdict requires `reattack_status: failed_to_bypass` with a non-empty `reattack_variants` array (≥ 3 entries). An empty or short variant set caps the verdict at `VERIFICATION_INCOMPLETE`, never `VERIFIED_SECURE`.
+</Note>
+
+### Stage 12 — `/mantis-calibrate`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json`; `workspace/kb/THREAT_MODEL.md`
+
+  **Writes:** `workspace/findings/<id>.json` — appends `impact_score`, `likelihood_score`, `mantis_risk_score` (1.0–10.0), `priority`, `inferred_exposure`, `calibration_checklist`, `outrage_commentary`, `executive_summary`
+
+  **What it does:** Calculates a final Mantis Risk Score for every finding using the formula `Hazard = (impact_score + likelihood_score) × exposure_multiplier`, then adds an outrage factor for publicly visible or high-attention vulnerabilities. The `calibration_checklist` records the reasoning behind each factor.
+</Accordion>
+
+### Stage 13 — `/mantis-reflect`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** Agent execution trajectories from the current pass; `workspace/findings/*.json`
+
+  **Writes:** `workspace/learnings.jsonl` — appends structured `trajectory_insight` entries
+
+  **What it does:** Parses the tool-call histories of agents from the current pass to extract false assumptions, tool failures, and successful strategies. These insights are written as `trajectory_insight` entries (with `type`, `action`, `target_entity`, `insight`, `source_stage`) and are consumed by `/mantis-architecture` at the start of the next pass to improve the KB.
+</Accordion>
+
+### Stage 14 — `/mantis-report`
+
+<Accordion title="Inputs, outputs, and workspace paths">
+  **Reads:** `workspace/findings/*.json`; `workspace/plan.json`; `workspace/kb/THREAT_MODEL.md`; `mantis-summary.md` files
+
+  **Writes:**
+  - `workspace/report/review_packet-latest.md` — latest human-readable report
+  - `workspace/report/review_packet_pass_<N>.md` — archived pass report
+
+  **What it does:** Generates a human-readable security review packet containing verified and reproduced findings, evidence chains, risk rationales, and patch diffs. This is the final deliverable of each pass and the document a security expert reviews before filing any reports.
+</Accordion>
+
+## Finding Status Transitions
+
+Findings evolve through a defined set of statuses as they move through the pipeline. The `status` field is written by the Researcher and updated by Review, and tracks validity:
+
+```text
+(created by researcher)
+       │
+       ▼
+PROVISIONALLY_VALID ──── review ────► VALID ──── critic ────► (no status change, viability updated)
+       │                                │
+       └────────────────────────────────┤
+NEEDS_RESEARCH ─────── review ─────────┤
+                                        │
+                              FALSE_POSITIVE (filtered out)
+                              DUPLICATE (merged, filtered out)
+```
+
+The `production_viability` field (set by the Critic) is separate from `status` and tracks release-build exploitability:
+
+| `production_viability` | Meaning |
+|---|---|
+| `VIABLE` | Triggerable in a production release build |
+| `NON_VIABLE` | Compiled out, blocked by environment, or debug-only |
+| `SAMPLE_OR_TEST` | Resides in test code or example code (non-production) |
+| `CONDITIONAL_VIABLE` | Exploitable only under specific non-default configurations |
+
+The `repro_status` field (set by the Reproducer) tracks dynamic validation:
+
+| `repro_status` | Meaning |
+|---|---|
+| `reproduced` | Reached-sink evidence confirmed; PoC executed successfully |
+| `statically_confirmed` | Static analysis confirms the vulnerability path without dynamic execution |
+| `not_attempted` | No reached-sink evidence yet; retry-eligible |
+| `failed_to_reproduce` | A valid harness reached the sink but the bug did not trigger |
+
+The `patch_status` field (set by the Patcher) tracks the fix lifecycle:
+
+| `patch_status` | Meaning |
+|---|---|
+| `VERIFIED_SECURE` | Post-patch run passed AND ≥ 3 re-attack variants all failed to bypass |
+| `MITIGATION_PROPOSED` | Binary target; code patching not possible, architectural mitigation proposed |
+| `VERIFICATION_INCOMPLETE` | Post-patch run passed but re-attack was interrupted or had fewer than 3 variants |
+| `VERIFICATION_FAILED` | Re-attack successfully bypassed the patch |
+| `ERROR` | Patching or re-attack encountered an unrecoverable error |

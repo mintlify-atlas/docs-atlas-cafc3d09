@@ -1,0 +1,173 @@
+---
+title: "/mantis-structural-index: Semantic Code Index Builder"
+sidebarTitle: "/mantis-structural-index"
+description: "Builds a content-addressed semantic index exposing call-graph queries and function boundaries to improve audit reasoning, degrading gracefully to grep."
+---
+
+The `/mantis-structural-index` skill constructs a content-addressed semantic index of your codebase, exposing `find_callers(symbol)`, `find_callees(symbol)`, and `get_function_boundary(file, line)` queries to downstream skills. It runs immediately after the snapshot is pinned — before summarize, architecture, or research — and degrades gracefully to a grep-only mode when no parsing backends are available. Use it when a pinned or live codebase is available and structural cross-reference data would improve research quality. Do not use it for findings analysis, patching, or reporting.
+
+## Command
+
+```
+/mantis-structural-index [--snapshot_root <dir>] [--snapshot_id <id>] [--state_root <dir>]
+```
+
+<ParamField path="--snapshot_root" type="string" optional>
+  Absolute path to the pinned, read-only code snapshot. The builder reads all source files from this directory.
+</ParamField>
+
+<ParamField path="--snapshot_id" type="string" optional>
+  The snapshot identifier for this pass. Used for reuse-on-match idempotency — if the manifest already carries this ID, the existing index is reused without rebuilding.
+</ParamField>
+
+<ParamField path="--state_root" type="string" optional>
+  Parent directory of `workspace/`. All index artifacts are written STATE-RELATIVE, never into `CODE_ROOT`. When absent, defaults to `./workspace/` relative to the current directory (MODE-OFF).
+</ParamField>
+
+<Note>
+  **All flags absent → MODE-OFF.** The index is built against the current directory with `snapshot_id = "unknown"`. MODE-OFF always triggers a full rebuild (the `"unknown"` ID is not a freshness signal). The index is still useful for downstream skills.
+</Note>
+
+## Input / Output Contract
+
+### Reads
+
+| Path | Purpose |
+|------|---------|
+| `workspace/.mantis_state.json` | `active_snapshot` for provenance and snapshot-aware rebuild logic |
+| `workspace/kb/structural_index/manifest.json` | Reuse-on-match idempotency check (primary) |
+| `workspace/kb/structural_index.jsonl` | Backward-compat provenance check if manifest absent |
+| `workspace/kb/structural_index/units/` | Content-addressed cache for incremental unit reuse |
+| `workspace/kb/structural_index/native/` | Prebuilt index attachments (SCIP, Kythe, LSIF) |
+| `CODE_ROOT` source files | All source files parsed by the builder script |
+
+### Writes
+
+| Path | Content |
+|------|---------|
+| `workspace/kb/structural_index/manifest.json` | Atomic commit point — written **last** via rename from `tmp/` |
+| `workspace/kb/structural_index/catalog.sqlite` | Query-optimized SQLite serving store |
+| `workspace/kb/structural_index/units/` | Content-addressed immutable unit outputs |
+| `workspace/kb/structural_index/shards/` | Partitioned serving data for large corpora |
+| `workspace/kb/structural_index/native/` | Prebuilt index attachments |
+| `workspace/kb/structural_index/tmp/` | Temporary objects during build |
+| `workspace/kb/structural_index.jsonl` | Compatibility pointer (full export below 10K records) |
+| `workspace/helpers/build_structural_index.py` | Builder helper (`MANTIS_HELPER_VERSION = 5`) |
+| `workspace/helpers/query_structural_index.py` | Query helper (`MANTIS_HELPER_VERSION = 5`) |
+
+## On-Disk Layout
+
+```
+workspace/kb/structural_index/
+├── manifest.json          # Atomic commit point — written LAST
+├── catalog.sqlite         # Query-optimized serving store
+├── units/                 # Content-addressed immutable unit outputs
+│   └── ab/cd/abcdef...    # sha256 prefix sharding (2+2 hex dirs)
+├── shards/                # Partitioned serving data (large corpora)
+├── native/                # Prebuilt index attachments (SCIP, Kythe, LSIF)
+│   ├── provenance.json
+│   ├── scip/
+│   └── kythe/
+└── tmp/                   # Temporary objects during build
+
+workspace/helpers/
+├── build_structural_index.py    # Builder (MANTIS_HELPER_VERSION = 5)
+└── query_structural_index.py    # Query helper (MANTIS_HELPER_VERSION = 5)
+
+workspace/kb/structural_index.jsonl  # Compatibility pointer
+```
+
+## Usage
+
+### Standalone invocation (MODE-OFF)
+
+```bash
+/mantis-structural-index
+```
+
+### With snapshot and state root (orchestrated)
+
+```bash
+/mantis-structural-index \
+  --snapshot_root /tmp/mantis/snapshots/snap_abc \
+  --snapshot_id snap_abc \
+  --state_root /tmp/mantis/state
+```
+
+### Querying the index from a downstream skill
+
+```bash
+# Resolve a symbol by name
+python3 workspace/helpers/query_structural_index.py \
+  resolve_symbol --name "parse_input" --language "c" \
+  --state_root /tmp/mantis/state
+
+# Find all callers (paginated)
+python3 workspace/helpers/query_structural_index.py \
+  find_callers --symbol_id "fallback:c:src/parser.c:a1b2c3d4e5f67890" \
+  --limit 100 --offset 0 --state_root /tmp/mantis/state
+
+# Get function boundary at a given line
+python3 workspace/helpers/query_structural_index.py \
+  get_function_boundary --file "src/parser.c" --line 87 \
+  --state_root /tmp/mantis/state
+```
+
+## Notes
+
+<Accordion title="Backend selection and precision tiers">
+  The builder uses **capability-based, per-partition backend selection** — not a single global ladder. For each language partition, it probes and selects the highest-available backend:
+
+  | Tier | Precision | Requires |
+  |------|-----------|---------|
+  | SCIP / LSIF / Kythe / clangd-static | `semantic` | Prebuilt native index matching the snapshot |
+  | Compiler / typechecker-backed | `typecheck` | `compile_commands.json` or build context |
+  | AST extraction (tree-sitter, ast-grep) | `ast` | Parser available on PATH |
+  | Symbol-only (ctags) | `symbol-only` | ctags on PATH |
+  | Heuristic regex | `heuristic` | Python stdlib only — zero dependencies |
+  | Coverage-only (grep fallback) | `coverage-only` | Always available |
+
+  When a partition cannot be indexed at any precision, the manifest records `status: "empty"` for that partition and consumers fall back to grep — today's exact behavior.
+</Accordion>
+
+<Accordion title="Idempotency and content-addressed caching">
+  When `manifest.json` already carries the current `SNAPSHOT_ID` (and it is not `"unknown"`), the index is **reused immediately** — no rebuild, no backend probing. This bounds cost across retries and crash-resume scenarios.
+
+  Individual semantic units are reused across snapshots via content-addressed cache keys:
+
+  ```
+  cache_key = sha256(
+      schema_version +
+      extractor_name@version +
+      language +
+      compile_context_digest +
+      ordered_input_content_digests +
+      dependency_or_interface_digest
+  )
+  ```
+
+  Note that `snapshot_id` is **not** in the cache key — it is provenance only. A unit that has not changed between two snapshots hits the cache and is reused without re-extraction.
+</Accordion>
+
+<Accordion title="HINT-only safety invariants">
+  The structural index is a **hint-only enhancement**. Downstream skills (plan, researcher) must audit the union of structural index results and grep results:
+
+  - The index decides **ORDER** of investigation priority, never **MEMBERSHIP** of the audit set.
+  - A symbol the index misses must still be reachable by the exhaustive grep sweep.
+  - `find_callers` returns hints, never authoritative membership. Consumers **must** union with grep.
+  - The index touches no findings and cannot violate the "never drop a finding" invariant.
+  - Build-derived reachability (whether a symbol is compiled into production) is explicitly out of scope.
+</Accordion>
+
+<Accordion title="Coverage-aware query interpretation">
+  Every query response includes a `coverage.partition_status` field. Consumers must interpret empty results accordingly:
+
+  | `partition_status` | Meaning | Required action |
+  |--------------------|---------|-----------------|
+  | `complete` | All files indexed | "No indexed callers" — still run grep (HINT-only rule) |
+  | `partial` | Some files deferred or failed | "Not fully indexed" — **must** run grep fallback |
+  | `empty` | No backend available | "Not indexed" — **must** run grep fallback |
+  | `failed` | Backend attempted but failed | "Index failed" — **must** run grep fallback |
+
+  The `precision` field on each result (`semantic` > `typecheck` > `ast` > `symbol-only` > `heuristic` > `deferred` > `coverage-only`) determines how much weight to give the result.
+</Accordion>
